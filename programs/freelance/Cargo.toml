@@ -1,0 +1,21 @@
+[package]
+name = "freelance"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anchor-lang = "0.30.1"
+anchor-spl = "0.30.1"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "freelance"
+path = "src/lib.rs"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
