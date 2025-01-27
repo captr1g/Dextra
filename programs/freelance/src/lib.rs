@@ -484,22 +484,7 @@ pub mod dextra {
 
     // Add these helper functions
     
-    impl ProtocolAccount {
-        pub fn setup_referrer(&mut self, user: Pubkey, referrer: Pubkey) -> Result<()> {
-            if !self.referrers.contains_key(&user) && referrer != Pubkey::default() {
-                self.referrers.insert(user, referrer);
-            }
-            Ok(())
-        }
     
-        pub fn is_claimable(&self, user: Pubkey) -> bool {
-            self.claimable_users.get(&user).unwrap_or(&false).clone()
-        }
-    
-        pub fn is_withdrawable(&self, user: Pubkey) -> bool {
-            self.withdrawable_users.get(&user).unwrap_or(&false).clone()
-        }
-    }
     
     fn process_ref_reward(
         ctx: Context<Claim>,
@@ -689,15 +674,7 @@ pub mod dextra {
     }
 
     // Add constant for space calculation
-    impl ProtocolAccount {
-        pub const LEN: usize = 32 + // owner
-                              32 + // governance
-                              2 +  // ref_percent
-                              8 +  // pool_count
-                              256 + // claimable_users (estimated size)
-                              256 + // withdrawable_users (estimated size)
-                              256;  // referrers (estimated size)
-    }
+    
     
     #[derive(Accounts)]
     pub struct Deposit<'info> {
@@ -820,6 +797,9 @@ pub struct ProtocolAccount {
     pub governance: Pubkey,
     pub ref_percent: u64,
     pub pool_count: u64,
+    pub referrers: HashMap<Pubkey, Pubkey>,
+    pub claimable_users: HashMap<Pubkey, bool>,
+    pub withdrawable_users: HashMap<Pubkey, bool>
 }
 
 // Implement constants separately
@@ -881,6 +861,22 @@ pub struct Initialize<'info> {
     pub system_program: Program<'info, System>
 }
 
+impl ProtocolAccount {
+    pub fn setup_referrer(&mut self, user: Pubkey, referrer: Pubkey) -> Result<()> {
+        if !self.referrers.contains_key(&user) && referrer != Pubkey::default() {
+            self.referrers.insert(user, referrer);
+        }
+        Ok(())
+    }
+
+    pub fn is_claimable(&self, user: Pubkey) -> bool {
+        self.claimable_users.get(&user).unwrap_or(&false).clone()
+    }
+
+    pub fn is_withdrawable(&self, user: Pubkey) -> bool {
+        self.withdrawable_users.get(&user).unwrap_or(&false).clone()
+    }
+}
 #[derive(Accounts)]
 pub struct AddPool<'info> {
 #[account(mut)]
