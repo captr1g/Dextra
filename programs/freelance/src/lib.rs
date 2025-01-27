@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, TokenAccount, Transfer};
-use anchor_lang::system_program::System;
+use anchor_spl::token::{Token, TokenAccount, Mint};
+use std::collections::HashMap;
 
 declare_id!("h6rV4RXhvStUghe9aHyjEEQw2f2k7ac4An7Kh8Qu1Ft");
 
@@ -8,487 +8,847 @@ declare_id!("h6rV4RXhvStUghe9aHyjEEQw2f2k7ac4An7Kh8Qu1Ft");
 pub mod dextra {
     use super::*;
 
-    // Initialize pool
-    pub fn initialize(
-        ctx: Context<Initialize>,
+    // Initialize the protocol
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        let protocol = &mut ctx.accounts.protocol;
+        protocol.owner = ctx.accounts.owner.key();
+        protocol.governance = ctx.accounts.owner.key();
+        protocol.ref_percent = 200; // 2%
+        protocol.pool_count = 0;
+        Ok(())
+    }
+    pub fn pool_length(ctx: Context<ViewState>) -> Result<u64> {
+        Ok(ctx.accounts.protocol.pool_count)
+    }
+
+    // Get deposits pool length for a specific user and pool
+    pub fn deposits_pool_length(ctx: Context<ViewUserPoolInfo>, pid: u64) -> Result<u64> {
+        // Check if pool exists
+        if pid >= ctx.accounts.protocol.pool_count {
+            return Ok(0);
+        }
+
+        // Check if user has any deposits
+        if ctx.accounts.user_info.amount == 0 {
+            return Ok(0);
+        }
+
+        // Return length of deposits array
+        Ok(ctx.accounts.user_info.deposits.len() as u64)
+    }
+
+    pub fn get_available_sum_for_withdraw(
+        ctx: Context<ViewUserPoolInfo>,
+        pid: u64
+    ) -> Result<u64> {
+        require!(pid < ctx.accounts.protocol.pool_count, ErrorCode::PoolDoesNotExist);
+        calculate_sum_available_for_withdraw(&ctx.accounts.user_info)
+    }
+    pub fn get_claimable(
+        ctx: Context<ViewUserPoolInfo>,
+        pid: u64
+    ) -> Result<u64> {
+        require!(pid < ctx.accounts.protocol.pool_count, ErrorCode::PoolDoesNotExist);
+        calculate_reward(pid, &ctx.accounts.user_info)
+    }
+
+    pub fn get_pool_rate_and_apy(
+        ctx: Context<ViewPool>,
+        pid: u64,
+        timestamp: i64
+    ) -> Result<(u64, u64)> {
+        require!(pid < ctx.accounts.protocol.pool_count, ErrorCode::PoolDoesNotExist);
+        let start_date = date_helper::get_start_of_date(timestamp);
+        let pool = &ctx.accounts.pool;
+        
+        let apy = pool.apys.get(&start_date).unwrap_or(&pool.last_apy);
+        let rate = pool.rates.get(&start_date).unwrap_or(&pool.last_rate);
+        
+        Ok((*apy, *rate))
+    }
+    pub fn get_deposit_info(
+        ctx: Context<ViewUserDeposit>,
+        pid: u64,
+        did: u64
+    ) -> Result<(u64, i64, i64, bool)> {
+        require!(pid < ctx.accounts.protocol.pool_count, ErrorCode::PoolDoesNotExist);
+        let deposit = &ctx.accounts.user_info.deposits[did as usize];
+        
+        Ok((
+            deposit.amount,
+            deposit.timestamp,
+            deposit.locked_until,
+            deposit.is_withdrawn
+        ))
+    }
+    pub fn verify_owner_or_governance(ctx: Context<VerifyOwnerOrGovernance>) -> Result<()> {
+        require!(
+            ctx.accounts.protocol.owner == ctx.accounts.signer.key() ||
+            ctx.accounts.protocol.governance == ctx.accounts.signer.key(),
+            ErrorCode::NotOwnerOrGovernance
+        );
+        Ok(())
+    }
+    // Add a new pool
+    pub fn add_pool(
+        ctx: Context<AddPool>,
         minimum_deposit: u64,
         lock_period: i64,
         can_swap: bool,
         rate: u64,
         apy: u64,
     ) -> Result<()> {
+        let protocol = &mut ctx.accounts.protocol;
         let pool = &mut ctx.accounts.pool;
-        pool.authority = ctx.accounts.authority.key();
+        let timestamp = Clock::get()?.unix_timestamp;
+        let start_date = date_helper::get_start_of_date(timestamp);
+
+        pool.deposit_token = ctx.accounts.deposit_token.key();
+        pool.reward_token = ctx.accounts.reward_token.key();
         pool.minimum_deposit = minimum_deposit;
         pool.lock_period = lock_period;
         pool.can_swap = can_swap;
         pool.last_rate = rate;
         pool.last_apy = apy;
+        pool.rates.insert(start_date, rate);
+        pool.apys.insert(start_date, apy);
+
+        protocol.pool_count += 1;
         Ok(())
     }
 
     // Deposit tokens
-    pub fn deposit(ctx: Context<Deposit>, amount: u64, referrer: Pubkey) -> Result<()> {
-        require!(
-            amount >= ctx.accounts.pool.minimum_deposit,
-            DextraError::InsufficientDeposit
-        );
+    pub fn deposit(
+        ctx: Context<Deposit>,
+        pool_id: u64,
+        amount: u64,
+        referrer: Option<Pubkey>,
+    ) -> Result<()> {
+        let pool = &ctx.accounts.pool;
+        let user_info = &mut ctx.accounts.user_info;
+        let protocol = &mut ctx.accounts.protocol;
+        let clock = Clock::get()?;
 
-        // Transfer tokens from user to pool
-        type TransferContext<'a, 'b, 'c, 'info> = CpiContext<'a, 'b, 'c, 'info, Transfer<'info>>;
-        let transfer_ctx: TransferContext = CpiContext::new(
+        require!(amount >= pool.minimum_deposit, ErrorCode::InsufficientDeposit);
+
+        // Setup referrer if provided
+        if let Some(ref_address) = referrer {
+            protocol.setup_referrer(ctx.accounts.user.key(), ref_address)?;
+        }
+
+        // Calculate pending reward
+        let pending_reward = calculate_reward(pool_id, user_info)?;
+        user_info.pending_reward = pending_reward;
+
+        // Update user info
+        user_info.amount = user_info.amount.checked_add(amount).unwrap();
+        user_info.last_claimed = clock.unix_timestamp;
+        
+        if user_info.stake_timestamp == 0 {
+            user_info.stake_timestamp = clock.unix_timestamp;
+        }
+
+        // Transfer tokens
+        let transfer_ctx = CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
-                from: ctx.accounts.user_token.to_account_info(),
-                to: ctx.accounts.pool_token.to_account_info(),
+                from: ctx.accounts.user_token_account.to_account_info(),
+                to: ctx.accounts.protocol_token_account.to_account_info(),
                 authority: ctx.accounts.user.to_account_info(),
             },
         );
         token::transfer(transfer_ctx, amount)?;
 
-        // Update user info
-        let user = &mut ctx.accounts.user_account;
-        user.amount = user.amount.checked_add(amount).unwrap();
-        user.stake_timestamp = Clock::get()?.unix_timestamp;
-        user.last_claimed = Clock::get()?.unix_timestamp;
-
         // Add deposit record
-        user.deposits.push(UserDeposit {
+        user_info.deposits.push(UserDeposit {
             amount,
-            timestamp: Clock::get()?.unix_timestamp,
-            locked_until: Clock::get()?.unix_timestamp + ctx.accounts.pool.lock_period,
+            timestamp: clock.unix_timestamp,
+            locked_until: clock.unix_timestamp + pool.lock_period,
             is_withdrawn: false,
+        });
+
+        emit!(DepositEvent {
+            user: ctx.accounts.user.key(),
+            pool_id,
+            amount,
+            referrer: referrer.unwrap_or_default(),
         });
 
         Ok(())
     }
 
-    pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
-        Ok(())
-    }
+    // Implement claim function
+    pub fn claim(ctx: Context<Claim>, pool_id: u64) -> Result<()> {
+        let pool = &ctx.accounts.pool;
+        let user_info = &mut ctx.accounts.user_info;
+        
+        require!(user_info.amount > 0, ErrorCode::NoDeposit);
+        require!(ctx.accounts.protocol.is_claimable(ctx.accounts.user.key()), ErrorCode::UnknownError);
+        // Calculate reward
+        let reward = calculate_reward(pool_id, &user_info)?;
 
-    pub fn add_pool(
-        ctx: Context<AddPool>,
-        deposit_token: Pubkey,
-        reward_token: Pubkey,
-        minimum_deposit: u64,
-        lock_period: u64,
-        can_swap: bool,
-        rate: u64,
-        apy: u64,
-    ) -> Result<()> {
-        // Verify authority is owner or governance
-        require!(
-            ctx.accounts.authority.key() == OWNER_PUBKEY || 
-            ctx.accounts.authority.key() == GOVERNANCE_PUBKEY,
-            CustomError::UnauthorizedAccess
+        // Transfer reward tokens
+        let transfer_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.protocol_reward_account.to_account_info(),
+                to: ctx.accounts.user_reward_account.to_account_info(),
+                authority: ctx.accounts.protocol.to_account_info(),
+            },
         );
+        token::transfer(transfer_ctx, reward)?;
 
-        let pool = &mut ctx.accounts.pool;
-        let state = &mut ctx.accounts.state;
-        
-        // Get current timestamp and start of day
-        let current_timestamp = Clock::get()?.unix_timestamp;
-        let start_of_day = DateHelper::get_start_of_date(current_timestamp);
-        
-        // Store initial rate and APY for the pool
-        let mut rates = HashMap::new();
-        rates.insert(start_of_day as u64, rate);
-        state.pool_rates.insert(pool.key().to_bytes(), rates);
-
-        let mut apys = HashMap::new();
-        apys.insert(start_of_day as u64, apy);
-        state.pool_apys.insert(pool.key().to_bytes(), apys);
-        
-        // Set pool information
-        pool.deposit_token = deposit_token;
-        pool.reward_token = reward_token;
-        pool.minimum_deposit = minimum_deposit;
-        pool.lock_period = lock_period;
-        pool.can_swap = can_swap;
-        pool.last_rate = rate;
-        pool.last_apy = apy;
-
-        Ok(())
-    }
-
-    pub fn update_rate(ctx: Context<UpdateRate>, pid: u64, rate: u64) -> Result<()> {
-        // Verify authority is owner or governance
-        require!(
-            ctx.accounts.authority.key() == OWNER_PUBKEY || 
-            ctx.accounts.authority.key() == GOVERNANCE_PUBKEY,
-            CustomError::UnauthorizedAccess
-        );
-
-        let pool = &mut ctx.accounts.pool;
-        let current_timestamp = Clock::get()?.unix_timestamp;
-        let start_of_day = DateHelper::get_start_of_date(current_timestamp);
-        
-        let state = &mut ctx.accounts.state;
-        
-        // Update pool rate for current day
-        if let Some(pool_rates) = state.pool_rates.get_mut(&pid) {
-            pool_rates.insert(start_of_day as u64, rate);
-        } else {
-            let mut rates = HashMap::new();
-            rates.insert(start_of_day as u64, rate);
-            state.pool_rates.insert(pid, rates);
+        // Process referral reward if applicable
+        if let Some(referrer) = user_info.referrer {
+            let ref_amount = reward.checked_mul(REF_PERCENT).unwrap().checked_div(10000).unwrap();
+            process_ref_reward(ctx, pool_id, ref_amount, referrer)?;
         }
 
-        // Update last rate
-        pool.last_rate = rate;
+        // Update user info
+        user_info.pending_reward = 0;
+        user_info.last_claimed = Clock::get()?.unix_timestamp;
+        user_info.total_claimed = user_info.total_claimed.checked_add(reward).unwrap();
+
+        emit!(ClaimEvent {
+            user: ctx.accounts.user.key(),
+            pool_id,
+            amount: reward,
+        });
 
         Ok(())
     }
+
+    // Implement withdraw function
+    pub fn withdraw(ctx: Context<Withdraw>, pool_id: u64) -> Result<()> {
+        let pool = &ctx.accounts.pool;
+        let user_info = &mut ctx.accounts.user_info;
+        
+        let available_amount = calculate_sum_available_for_withdraw(user_info)?;
+        require!(available_amount > 0, ErrorCode::NothingToWithdraw);
+        require!(user_info.amount >= available_amount, ErrorCode::InsufficientAmount);
+        require!(ctx.accounts.protocol.is_withdrawable(ctx.accounts.user.key()), ErrorCode::UnknownError);
+        // Transfer deposit tokens back to user
+        let transfer_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.protocol_token_account.to_account_info(),
+                to: ctx.accounts.user_token_account.to_account_info(),
+                authority: ctx.accounts.protocol.to_account_info(),
+            },
+        );
+        token::transfer(transfer_ctx, available_amount)?;
+
+        // Update user info
+        mark_deposits_as_withdrawn(user_info)?;
+        user_info.amount = user_info.amount.checked_sub(available_amount).unwrap();
+
+        if user_info.amount == 0 {
+            user_info.stake_timestamp = 0;
+            user_info.last_claimed = 0;
+        }
+
+        emit!(WithdrawEvent {
+            user: ctx.accounts.user.key(),
+            pool_id,
+            amount: available_amount,
+        });
+
+        Ok(())
+    }
+
+    // Implement swap function
+    pub fn swap(ctx: Context<Swap>, pool_id: u64, amount: u64, direction: bool) -> Result<()> {
+        let pool = &ctx.accounts.pool;
+        require!(pool.can_swap, ErrorCode::SwapNotSupported);
+
+        let received_amount = calculate_swap(pool_id, amount, direction)?;
+
+        // Transfer input tokens to protocol
+        let transfer_in_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.user_input_account.to_account_info(),
+                to: ctx.accounts.protocol_input_account.to_account_info(),
+                authority: ctx.accounts.user.to_account_info(),
+            },
+        );
+        token::transfer(transfer_in_ctx, amount)?;
+
+        // Transfer output tokens to user
+        let transfer_out_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.protocol_output_account.to_account_info(),
+                to: ctx.accounts.user_output_account.to_account_info(),
+                authority: ctx.accounts.protocol.to_account_info(),
+            },
+        );
+        token::transfer(transfer_out_ctx, received_amount)?;
+
+        emit!(SwapEvent {
+            user: ctx.accounts.user.key(),
+            pool_id,
+            amount,
+            direction,
+            received_amount,
+        });
+
+        Ok(())
+    }
+
+    // Admin functions
+    // Add these admin function implementations
+    pub fn update_rate(ctx: Context<UpdatePool>, pid: u64, new_rate: u64) -> Result<()> {
+        let pool = &mut ctx.accounts.pool;
+        let timestamp = Clock::get()?.unix_timestamp;
+        let start_date = date_helper::get_start_of_date(timestamp);
+        
+        pool.rates.insert(start_date, new_rate);
+        pool.last_rate = new_rate;
+        
+        Ok(())
+    }
+
+    pub fn update_apy(ctx: Context<UpdatePool>, pid: u64, new_apy: u64) -> Result<()> {
+        let pool = &mut ctx.accounts.pool;
+        let timestamp = Clock::get()?.unix_timestamp;
+        let start_date = date_helper::get_start_of_date(timestamp);
+        
+        pool.apys.insert(start_date, new_apy);
+        pool.last_apy = new_apy;
+        
+        Ok(())
+    }
+
+    pub fn get_deposit_info(
+        ctx: Context<ViewUserDeposit>,
+        deposit_id: u64,
+    ) -> Result<(u64, i64, i64, bool)> {
+        let deposit = &ctx.accounts.user_info.deposits[deposit_id as usize];
+        Ok((
+            deposit.amount,
+            deposit.timestamp,
+            deposit.locked_until,
+            deposit.is_withdrawn,
+        ))
+    }
+
+    pub fn get_claimable(
+        ctx: Context<ViewUserInfo>,
+        pool_id: u64,
+    ) -> Result<u64> {
+        calculate_reward(pool_id, &ctx.accounts.user_info)
+    }
+
+    pub fn get_pool_rate_and_apy(
+        ctx: Context<ViewPool>,
+        timestamp: i64,
+    ) -> Result<(u64, u64)> {
+        let pool = &ctx.accounts.pool;
+        let start_date = date_helper::get_start_of_date(timestamp);
+        Ok((
+            pool.rates.get(&start_date).unwrap_or(&pool.last_rate).clone(),
+            pool.apys.get(&start_date).unwrap_or(&pool.last_apy).clone(),
+        ))
+    }    
     pub fn update_pool(
-        ctx: Context<UpdatePool>,
-        minimum_deposit: u64,
-        lock_period: u64,
-        can_swap: bool,
+            ctx: Context<UpdatePool>,
+            pid: u64,
+            minimum_deposit: u64,
+            lock_period: i64,
+            can_swap: bool,
+        ) -> Result<()> {
+            let pool = &mut ctx.accounts.pool;
+            pool.minimum_deposit = minimum_deposit;
+            pool.lock_period = lock_period;
+            pool.can_swap = can_swap;
+            Ok(())
+    }
+    
+    pub fn approve(
+        ctx: Context<Approve>,
+        user: Pubkey,
+        approval_type: u8,
     ) -> Result<()> {
-        // Verify authority is owner or governance
-        require!(
-            ctx.accounts.authority.key() == OWNER_PUBKEY || 
-            ctx.accounts.authority.key() == GOVERNANCE_PUBKEY,
-            CustomError::UnauthorizedAccess
-        );
-
-        let pool = &mut ctx.accounts.pool;
+        let protocol = &mut ctx.accounts.protocol;
         
-        pool.minimum_deposit = minimum_deposit;
-        pool.lock_period = lock_period;
-        pool.can_swap = can_swap;
-
-        Ok(())
-    }
-    pub fn approve(ctx: Context<Approve>, approval_type: u8) -> Result<()> {
-        // Verify authority is owner or governance
-        require!(
-            ctx.accounts.authority.key() == OWNER_PUBKEY || 
-            ctx.accounts.authority.key() == GOVERNANCE_PUBKEY,
-            CustomError::UnauthorizedAccess
-        );
-
-        let state = &mut ctx.accounts.state;
-        let user = ctx.accounts.user.key();
-
         if approval_type == 0 || approval_type == 2 {
-            state.is_claimable.insert(user, true);
+            protocol.claimable_users.insert(user, true);
         }
-
+        
         if approval_type == 1 || approval_type == 2 {
-            state.is_withdrawable.insert(user, true);
+            protocol.withdrawable_users.insert(user, true);
         }
-
+        
+        Ok(())
+    }
+    
+    pub fn masscall(
+        ctx: Context<Masscall>,
+        governance: Pubkey,
+        setup_data: Vec<u8>,
+    ) -> Result<()> {
+        let protocol = &mut ctx.accounts.protocol;
+        protocol.governance = governance;
         Ok(())
     }
 
-    pub fn masscall(ctx: Context<MassCall>, setup_data: Vec<u8>) -> Result<()> {
-        // Verify authority is owner or governance
-        require!(
-            ctx.accounts.authority.key() == OWNER_PUBKEY || 
-            ctx.accounts.authority.key() == GOVERNANCE_PUBKEY,
-            CustomError::UnauthorizedAccess
-        );
+    // Add view function implementations
+    pub fn get_pool_length(ctx: Context<ViewState>) -> Result<u64> {
+        Ok(ctx.accounts.protocol.pool_count)
+    }
 
-        // Execute call with provided setup data
-        let ix = solana_program::instruction::Instruction {
-            program_id: ctx.accounts.governance.key(),
-            accounts: vec![],
-            data: setup_data
+    pub fn get_deposits_pool_length(ctx: Context<ViewUserInfo>) -> Result<u64> {
+        Ok(ctx.accounts.user_info.deposits.len() as u64)
+    }
+
+    pub fn get_available_sum_for_withdraw(ctx: Context<ViewUserInfo>) -> Result<u64> {
+        calculate_sum_available_for_withdraw(&ctx.accounts.user_info)
+    }
+
+    // Add helper function implementations
+    fn calculate_reward(pool_id: u64, user_info: &UserInfo,  pool: &Pool) -> Result<u64> {
+        let amount = user_info.amount;
+        let last_claimed = user_info.last_claimed;
+        let total_reward = user_info.pending_reward;
+        
+        // Early return if no amount or never claimed
+        if amount == 0 || last_claimed == 0 {
+            return Ok(total_reward);
+        }
+
+        let clock = Clock::get()?;
+        let start_timestamp = date_helper::get_start_of_date(last_claimed);
+        let mut total_time_reward = 0u64;
+        let mut current_claimed = last_claimed;
+
+        // Calculate rewards for each day
+        let seconds_per_day: i64 = 86400;
+        let mut timestamp = start_timestamp;
+        
+        while timestamp < clock.unix_timestamp {
+            let end_day = timestamp + seconds_per_day;
+            let applicable_timestamp = if end_day > clock.unix_timestamp {
+                clock.unix_timestamp - current_claimed
+            } else {
+                end_day - current_claimed
+            };
+
+            let apy = pool.apys.get(&timestamp).unwrap_or(&pool.last_apy);
+            let rate = pool.rates.get(&timestamp).unwrap_or(&pool.last_rate);
+
+            // Calculate yield for the day
+            let yield_amount = (amount as u128)
+                .checked_mul(applicable_timestamp as u128).unwrap()
+                .checked_mul(*apy as u128).unwrap()
+                .checked_div((100 * 365 * 86400 * 100) as u128).unwrap();
+
+            total_time_reward = total_time_reward
+                .checked_add((yield_amount as u64)
+                    .checked_mul(*rate).unwrap()
+                    .checked_div(1_000_000).unwrap())
+                .unwrap();
+
+            current_claimed = if end_day > clock.unix_timestamp {
+                clock.unix_timestamp
+            } else {
+                end_day
+            };
+            
+            timestamp += seconds_per_day;
+        }
+
+        // Handle decimal precision differences
+        let deposit_decimals = safe_decimals(&pool.deposit_token)?;
+        let receive_decimals = safe_decimals(&pool.reward_token)?;
+
+        let adjusted_reward = if receive_decimals >= deposit_decimals {
+            total_time_reward.checked_mul(10u64.pow((receive_decimals - deposit_decimals) as u32)).unwrap()
+        } else {
+            total_time_reward.checked_div(10u64.pow((deposit_decimals - receive_decimals) as u32)).unwrap()
         };
 
-        solana_program::program::invoke(
-            &ix,
-            &[ctx.accounts.governance.to_account_info()]
-        ).map_err(|_| error!(CustomError::CallFailed))?;
-
-        Ok(())
+        Ok(total_reward.checked_add(adjusted_reward).unwrap())
     }
 
+    fn safe_decimals<'a>(token: &'a AccountInfo<'a>) -> Result<u8> {
+        if token.key() == Pubkey::default() {
+            Ok(18)  // Default for native token
+        } else {
+            match Account::<Mint>::try_from(token) {
+                Ok(mint) => Ok(mint.decimals),
+                Err(_) => Ok(9)  // Default fallback for SPL tokens
+            }
+        }
+    }
+
+    // Add these helper functions
+    
+    impl ProtocolAccount {
+        pub fn setup_referrer(&mut self, user: Pubkey, referrer: Pubkey) -> Result<()> {
+            if !self.referrers.contains_key(&user) && referrer != Pubkey::default() {
+                self.referrers.insert(user, referrer);
+            }
+            Ok(())
+        }
+    
+        pub fn is_claimable(&self, user: Pubkey) -> bool {
+            self.claimable_users.get(&user).unwrap_or(&false).clone()
+        }
+    
+        pub fn is_withdrawable(&self, user: Pubkey) -> bool {
+            self.withdrawable_users.get(&user).unwrap_or(&false).clone()
+        }
+    }
+    
+    fn process_ref_reward(
+        ctx: Context<Claim>,
+        pool_id: u64,
+        ref_amount: u64,
+        referrer: Pubkey
+    ) -> Result<()> {
+        if referrer != Pubkey::default() {
+            let transfer_ctx = CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.protocol_reward_account.to_account_info(),
+                    to: ctx.accounts.user_reward_account.to_account_info(),
+                    authority: ctx.accounts.protocol.to_account_info(),
+                },
+            );
+            token::transfer(transfer_ctx, ref_amount)?;
+        }
+        Ok(())
+    }
+    
+    fn mark_deposits_as_withdrawn(user_info: &mut UserInfo) -> Result<()> {
+        let clock = Clock::get()?;
+        for deposit in &mut user_info.deposits {
+            if !deposit.is_withdrawn && deposit.locked_until <= clock.unix_timestamp {
+                deposit.is_withdrawn = true;
+            }
+        }
+        Ok(())
+    }
+    
+    fn calculate_sum_available_for_withdraw(user_info: &UserInfo) -> Result<u64> {
+        let clock = Clock::get()?;
+        let mut sum = 0;
+        
+        for deposit in &user_info.deposits {
+            if !deposit.is_withdrawn && deposit.locked_until <= clock.unix_timestamp {
+                sum = sum.checked_add(deposit.amount).unwrap();
+            }
+        }
+    
+        Ok(sum)
+    }
+    
+    fn calculate_swap(ctx: Context<Swap>, pool_id: u64, amount: u64, direction: bool) -> Result<u64> {
+        let pool = &ctx.accounts.pool;
+        let timestamp = Clock::get()?.unix_timestamp;
+        let start_date = date_helper::get_start_of_date(timestamp);
+        
+        // Get rate for current date or use last rate if not available
+        let rate = pool.rates.get(&start_date).unwrap_or(&pool.last_rate);
+
+        // Determine deposit and receive tokens based on direction
+        let (deposit_token, receive_token) = if direction {
+            (pool.reward_token, pool.deposit_token)
+        } else {
+            (pool.deposit_token, pool.reward_token)
+    };
+
+    // Get decimals for both tokens
+    let deposit_decimals = safe_decimals(&deposit_token)?;
+    let receive_decimals = safe_decimals(&receive_token)?;
+
+    // Calculate received amount based on direction
+    let received_amount = if direction {
+        (amount * 1_000_000) / rate
+    } else {
+        (amount * rate) / 1_000_000
+    };
+
+    // Adjust for decimal differences
+    let adjusted_amount = if receive_decimals >= deposit_decimals {
+        received_amount.checked_mul(10u64.pow((receive_decimals - deposit_decimals) as u32)).unwrap()
+    } else {
+        received_amount.checked_div(10u64.pow((deposit_decimals - receive_decimals) as u32)).unwrap()
+    };
+
+    Ok(adjusted_amount)
+    }
+    
+    fn safe_send_from_pool(
+        ctx: &Context<Claim>,
+        pool: &Account<Pool>,
+        to: &AccountInfo,
+        amount: u64,
+        is_claim: bool,
+    ) -> Result<()> {
+        let token = if is_claim {
+            pool.reward_token
+        } else {
+            pool.deposit_token
+        };
+
+    if token == Pubkey::default() {
+        // Handle native SOL transfer
+        safe_transfer_sol(
+            to,
+            &ctx.accounts.protocol.to_account_info(),
+            amount,
+        )?;
+    } else {
+        // Handle SPL token transfer
+        let transfer_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: if is_claim {
+                    ctx.accounts.protocol_reward_account.to_account_info()
+                } else {
+                    ctx.accounts.protocol_token_account.to_account_info()
+                },
+                to: if is_claim {
+                    ctx.accounts.user_reward_account.to_account_info()
+                } else {
+                    ctx.accounts.user_token_account.to_account_info()
+                },
+                authority: ctx.accounts.protocol.to_account_info(),
+            },
+        );
+        token::transfer(transfer_ctx, amount)?;
+    }
+
+    Ok(())
+}
+
+
+
+    // Add missing events
+    #[event]
+    pub struct ClaimEvent {
+        pub user: Pubkey,
+        pub pool_id: u64,
+        pub amount: u64,
+    }
+    
+    #[event]
+    pub struct WithdrawEvent {
+        pub user: Pubkey,
+        pub pool_id: u64,
+        pub amount: u64,
+    }
+    
+    #[event]
+    pub struct SwapEvent {
+        pub user: Pubkey,
+        pub pool_id: u64,
+        pub amount: u64,
+        pub direction: bool,
+        pub received_amount: u64,
+    }
+    
+    // Add missing account validation structures
     #[derive(Accounts)]
     pub struct Approve<'info> {
         #[account(mut)]
+        pub protocol: Account<'info, ProtocolAccount>,
+        #[account(constraint = protocol.owner == authority.key() || protocol.governance == authority.key())]
         pub authority: Signer<'info>,
-        /// CHECK: This account just stores the user's public key
-        pub user: AccountInfo<'info>,
+    }
+    
+    #[derive(Accounts)]
+    pub struct Masscall<'info> {
         #[account(mut)]
-        pub state: Account<'info, DextraState>,
+        pub protocol: Account<'info, ProtocolAccount>,
+        #[account(constraint = protocol.owner == authority.key())]
+        pub authority: Signer<'info>,
     }
 
-    pub mod transfer_helper {
-        use super::*;
+    // Add missing error codes
+    #[error_code]
+    pub enum ErrorCode {
+        #[msg("Evil: failed")]
+        EvilFailed,
+        #[msg("Caller is not the owner, neither governance")]
+        NotOwnerOrGovernance,
+    }
+
+    // Add referrer field to UserInfo
+    #[account]
+    pub struct UserInfo {
+        pub amount: u64,
+        pub pending_reward: u64,
+        pub last_claimed: i64,
+        pub total_claimed: u64,
+        pub stake_timestamp: i64,
+        pub deposits: Vec<UserDeposit>,
+        pub referrer: Option<Pubkey>,  // Add this field
+    }
+
+    // Add constant for space calculation
+    impl ProtocolAccount {
+        pub const LEN: usize = 32 + // owner
+                              32 + // governance
+                              2 +  // ref_percent
+                              8 +  // pool_count
+                              256 + // claimable_users (estimated size)
+                              256 + // withdrawable_users (estimated size)
+                              256;  // referrers (estimated size)
+    }
     
-        pub fn safe_approve<'info>(
-            token_program: &AccountInfo<'info>,
-            token_account: &Account<'info, TokenAccount>,
-            delegate: &AccountInfo<'info>,
-            authority: &Signer<'info>,
-            value: u64,
-        ) -> Result<()> {
-            token::approve(
-                CpiContext::new(
-                    token_program.clone(),
-                    token::Approve {
-                        to: token_account.to_account_info(),
-                        delegate: delegate.clone(),
-                        authority: authority.to_account_info(),
-                    },
-                ),
-                value,
-            ).map_err(|_| error!(TransferError::ApproveFailed))
-        }
+    #[derive(Accounts)]
+    pub struct Deposit<'info> {
+        #[account(mut)]
+        pub pool: Account<'info, Pool>,
+        #[account(init_if_needed, payer = user, space = 8 + UserInfo::LEN)]
+        pub user_info: Account<'info, UserInfo>,
+        #[account(mut)]
+        pub protocol: Account<'info, ProtocolAccount>,
+        #[account(mut)]
+        pub user_token_account: Account<'info, TokenAccount>,
+        #[account(mut, seeds = [b"protocol_token", pool.key().as_ref()], bump)]
+        pub protocol_token_account: Account<'info, TokenAccount>,
+        pub user: Signer<'info>,
+        pub token_program: Program<'info, Token>,
+        pub system_program: Program<'info, System>,
+    }
+    // Account validation for viewing user pool info
+    #[derive(Accounts)]
+    pub struct ViewUserPoolInfo<'info> {
+        pub protocol: Account<'info, ProtocolAccount>,
+        pub user_info: Account<'info, UserInfo>,
+    }
     
-        pub fn safe_transfer<'info>(
-            token_program: &AccountInfo<'info>,
-            from: &Account<'info, TokenAccount>,
-            to: &Account<'info, TokenAccount>,
-            authority: &Signer<'info>,
-            value: u64,
-        ) -> Result<()> {
-            token::transfer(
-                CpiContext::new(
-                    token_program.clone(),
-                    Transfer {
-                        from: from.to_account_info(),
-                        to: to.to_account_info(),
-                        authority: authority.to_account_info(),
-                    },
-                ),
-                value,
-            ).map_err(|_| error!(TransferError::TransferFailed))
-        }
+    #[derive(Accounts)]
+    pub struct Claim<'info> {
+        #[account(mut)]
+        pub pool: Account<'info, Pool>,
+        #[account(mut)]
+        pub user_info: Account<'info, UserInfo>,
+        #[account(mut)]
+        pub protocol: Account<'info, ProtocolAccount>,
+        #[account(mut)]
+        pub protocol_reward_account: Account<'info, TokenAccount>,
+        #[account(mut)]
+        pub user_reward_account: Account<'info, TokenAccount>,
+        pub user: Signer<'info>,
+        pub token_program: Program<'info, Token>,
+    }
     
-        pub fn safe_transfer_from<'info>(
-            token_program: &AccountInfo<'info>,
-            from: &Account<'info, TokenAccount>,
-            to: &Account<'info, TokenAccount>,
-            authority: &Signer<'info>,
-            value: u64,
-        ) -> Result<()> {
-            token::transfer(
-                CpiContext::new(
-                    token_program.clone(),
-                    Transfer {
-                        from: from.to_account_info(),
-                        to: to.to_account_info(),
-                        authority: authority.to_account_info(),
-                    },
-                ),
-                value,
-            ).map_err(|_| error!(TransferError::TransferFromFailed))
-        }
+    #[derive(Accounts)]
+    pub struct Withdraw<'info> {
+        #[account(mut)]
+        pub pool: Account<'info, Pool>,
+        #[account(mut)]
+        pub user_info: Account<'info, UserInfo>,
+        #[account(mut)]
+        pub protocol: Account<'info, ProtocolAccount>,
+        #[account(mut)]
+        pub protocol_token_account: Account<'info, TokenAccount>,
+        #[account(mut)]
+        pub user_token_account: Account<'info, TokenAccount>,
+        pub user: Signer<'info>,
+        pub token_program: Program<'info, Token>,
+    }
+    
+    #[derive(Accounts)]
+    pub struct Swap<'info> {
+        #[account(mut)]
+        pub pool: Account<'info, Pool>,
+        #[account(mut)]
+        pub user_input_account: Account<'info, TokenAccount>,
+        #[account(mut)]
+        pub user_output_account: Account<'info, TokenAccount>,
+        #[account(mut)]
+        pub protocol_input_account: Account<'info, TokenAccount>,
+        #[account(mut)]
+        pub protocol_output_account: Account<'info, TokenAccount>,
+        pub user: Signer<'info>,
+        pub token_program: Program<'info, Token>,
+    }
+    
+    #[derive(Accounts)]
+    pub struct ViewPool<'info> {
+        pub pool: Account<'info, Pool>,
+    }
+    
+    #[derive(Accounts)]
+    pub struct ViewState<'info> {
+        pub protocol: Account<'info, ProtocolAccount>,
+    }
+    
+    // Add missing error codes
+    #[error_code]
+    pub enum ErrorCode {
+        #[msg("Pool does not exist")]
+        PoolDoesNotExist,
+        #[msg("Amount is less than minimum deposit")]
+        InsufficientDeposit,
+        #[msg("Invalid amount")]
+        InvalidAmount,
+        #[msg("No deposit")]
+        NoDeposit,
+        #[msg("Nothing to withdraw")]
+        NothingToWithdraw,
+        #[msg("Insufficient amount")]
+        InsufficientAmount,
+        #[msg("Unknown error")]
+        UnknownError,
+        #[msg("Swap not supported")]
+        SwapNotSupported,
+    }
+
+    pub fn verify_owner_or_governance(
+        ctx: Context<VerifyOwnerOrGovernance>,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.protocol.owner == ctx.accounts.signer.key() 
+            || ctx.accounts.protocol.governance == ctx.accounts.signer.key(),
+            ErrorCode::NotOwnerOrGovernance
+        );
+        Ok(())
     }
 }
 
-#[derive(Accounts)]
-pub struct Initialize<'info> {
-    #[account(init, payer = authority, space = 8 + PoolInfo::LEN)]
-    pub pool: Account<'info, PoolInfo>,
-    #[account(mut)]
-    pub authority: Signer<'info>,
-    pub system_program: Program<'info, System>,
+// Account structures
+#[account]
+pub struct ProtocolAccount {
+    pub owner: Pubkey,
+    pub governance: Pubkey,
+    pub ref_percent: u64,
+    pub pool_count: u64,
 }
 
-#[derive(Accounts)]
-#[instruction(amount: u64, referrer: Pubkey)]
-pub struct Deposit<'info> {
-    #[account(mut)]
-    pub pool: Account<'info, Pool>,
-    #[account(mut)]
-    pub user: Signer<'info>,
-    #[account(
-        mut,
-        payer = user,
-        space = 8 + UserInfo::LEN,
-        seeds = [b"user", pool.key().as_ref(), user.key().as_ref()],
-        bump
-    )]
-    pub user_account: Box<Account<'info, UserInfo>>,
-    #[account(mut)]
-    pub user_token: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub pool_token: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    #[account(mut)]
-    /// CHECK: This is not dangerous because we don't read or write from this account
-    pub token_account: AccountInfo<'info>,
-}
-
-#[derive(Accounts)]
-pub struct Withdraw<'info> {
-    #[account(mut)]
-    pub pool: Account<'info, Pool>,
-    #[account(mut)]
-    pub user: Signer<'info>,
-    #[account(
-        mut,
-        seeds = [b"user", pool.key().as_ref(), user.key().as_ref()],
-        bump
-    )]
-    pub user_account: Account<'info, UserInfo>,
-    #[account(mut)]
-    pub user_token: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub pool_token: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
+// Implement constants separately
+impl ProtocolAccount {
+    pub const LEN: usize = 32 + 32 + 8 + 8;
 }
 
 #[account]
-    pub struct DextraState {
-        pub is_claimable: HashMap<Pubkey, bool>,
-        pub is_withdrawable: HashMap<Pubkey, bool>,
-        pub referrers: HashMap<Pubkey, Pubkey>,
-        pub user_info: HashMap<u64, HashMap<Pubkey, UserInfo>>,
-        pub pool_rates: HashMap<u64, HashMap<u64, u64>>,
-        pub pool_apys: HashMap<u64, HashMap<u64, u64>>,
-        pub governance: Pubkey,
-        pub ref_percent: u64, // 200 = 2%
-    }
-pub fn update_rate(ctx: Context<UpdateRate>, rate: u64) -> Result<()> {
-    let pool = &mut ctx.accounts.pool;
-    let current_timestamp = Clock::get()?.unix_timestamp;
-    let start_of_day = DateHelper::get_start_of_date(current_timestamp);
-    
-    let state = &mut ctx.accounts.state;
-    
-    // Update pool rate for current day
-    if let Some(pool_rates) = state.pool_rates.get_mut(&pool.key().to_bytes()) {
-        pool_rates.insert(start_of_day as u64, rate);
-    } else {
-        let mut rates = HashMap::new();
-        rates.insert(start_of_day as u64, rate);
-        state.pool_rates.insert(pool.key().to_bytes(), rates);
-    }
-
-    // Update last rate
-    pool.last_rate = rate;
-
-    Ok(())
-}
-
-#[derive(Accounts)]
-pub struct UpdateRate<'info> {
-    #[account(mut)]
-    pub authority: Signer<'info>,
-    
-    #[account(
-        mut,
-        seeds = [b"pool", authority.key().as_ref()],
-        bump = pool.bump,
-    )]
-    pub pool: Account<'info, Pool>,
-
-    #[account(mut)]
-    pub state: Account<'info, DextraState>,
-}
-pub fn update_apy(ctx: Context<UpdateApy>, apy: u64) -> Result<()> {
-    // Verify authority is owner or governance
-    require!(
-        ctx.accounts.authority.key() == OWNER_PUBKEY || 
-        ctx.accounts.authority.key() == GOVERNANCE_PUBKEY,
-        CustomError::UnauthorizedAccess
-    );
-
-    // Validate APY is within reasonable bounds (e.g., 0-10000 for 0-100%)
-    require!(apy <= 10000, CustomError::InvalidAPY);
-
-    let pool = &mut ctx.accounts.pool;
-    let current_timestamp = Clock::get()?.unix_timestamp;
-    let start_of_day = DateHelper::get_start_of_date(current_timestamp);
-    
-    let state = &mut ctx.accounts.state;
-    
-    // Update pool apy for current day
-    if let Some(pool_apys) = state.pool_apys.get_mut(&pool.key().to_bytes()) {
-        pool_apys.insert(start_of_day as u64, apy);
-    } else {
-        let mut apys = HashMap::new();
-        apys.insert(start_of_day as u64, apy);
-        state.pool_apys.insert(pool.key().to_bytes(), apys);
-    }
-
-    // Update last apy
-    pool.last_apy = apy;
-
-    Ok(())
-}
-
-#[derive(Accounts)]
-pub struct UpdateApy<'info> {
-    #[account(mut)]
-    pub authority: Signer<'info>,
-    
-    #[account(
-        mut,
-        seeds = [b"pool", authority.key().as_ref()],
-        bump = pool.bump,
-    )]
-    pub pool: Account<'info, Pool>,
-
-    #[account(mut)]
-    pub state: Account<'info, DextraState>,
-}
-#[account]
-#[derive(Default, Copy)]
-pub struct PoolInfo {
-    pub deposit_token: Pubkey,    // Token mint address for deposit token
-    pub reward_token: Pubkey,     // Token mint address for reward token
+pub struct Pool {
+    pub deposit_token: Pubkey,
+    pub reward_token: Pubkey,
     pub minimum_deposit: u64,
-    pub lock_period: u64,
+    pub lock_period: i64,
     pub can_swap: bool,
     pub last_rate: u64,
     pub last_apy: u64,
+    pub rates: HashMap<i64, u64>,
+    pub apys: HashMap<i64, u64>,
 }
 
 #[account]
-pub struct DateHelper {}
-
-impl DateHelper {
-    pub const SECONDS_PER_DAY: i64 = 86400; // 24 * 60 * 60
-
-    pub fn get_start_of_date(timestamp: i64) -> i64 {
-        (timestamp / Self::SECONDS_PER_DAY) * Self::SECONDS_PER_DAY
-    }
-
-    pub fn get_end_of_date(timestamp: i64) -> i64 {
-        (timestamp / Self::SECONDS_PER_DAY) * Self::SECONDS_PER_DAY + Self::SECONDS_PER_DAY - 1
-    }
-
-    pub fn get_diff_days(timestamp1: i64, timestamp2: i64) -> i64 {
-        (timestamp1 - timestamp2) / Self::SECONDS_PER_DAY
-    }
-}
-
-
-#[account]
-#[derive(Default)]
 pub struct UserInfo {
     pub amount: u64,
-    pub pending_reward: u64, 
+    pub pending_reward: u64,
     pub last_claimed: i64,
     pub total_claimed: u64,
     pub stake_timestamp: i64,
     pub deposits: Vec<UserDeposit>,
-}
-
-impl UserInfo {
-    pub fn new() -> Self {
-        Self {
-            amount: 0,
-            pending_reward: 0,
-            last_claimed: 0,
-            total_claimed: 0,
-            stake_timestamp: 0,
-            deposits: Vec::new(),
-        }
-    }
-}
-
-impl DextraState {
-    pub const REF_PERCENT: u64 = 200; // 2%
+    pub referrer: Option<Pubkey>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -500,320 +860,128 @@ pub struct UserDeposit {
 }
 
 
+// Events
+#[event]
+pub struct DepositEvent {
+    pub user: Pubkey,
+    pub pool_id: u64,
+    pub amount: u64,
+    pub referrer: Pubkey,
+}
+
+// Account validation structures
 #[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(mut)]
+    pub user_info: Account<'info, UserInfo>,
+    #[account(init, payer = owner, space = 8 + ProtocolAccount::LEN)]
+    pub protocol: Account<'info, ProtocolAccount>,
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub system_program: Program<'info, System>
+}
+
 #[derive(Accounts)]
-    pub struct AddPool<'info> {
-        #[account(mut)]
-        pub authority: Signer<'info>,
-        #[account(
-            init,
-            payer = authority,
-            space = 8 + std::mem::size_of::<Pool>()
-        )]
-        pub pool: Account<'info, Pool>,
-        pub system_program: Program<'info, System>,
+pub struct AddPool<'info> {
+#[account(mut)]
+pub pool: Account<'info, Pool>,
+pub deposit_token: Account<'info, Mint>,
+pub reward_token: Account<'info, Mint>,
+#[account(mut)]
+pub protocol: Account<'info, ProtocolAccount>,
+#[account(constraint = protocol.owner == authority.key() || protocol.governance == authority.key())]
+pub authority: Signer<'info>,
+pub system_program: Program<'info, System>
+}
+// Add ViewUserDeposit account validation structure
+#[derive(Accounts)]
+pub struct ViewUserDeposit<'info> {
+    pub user_info: Account<'info, UserInfo>,
+    pub user: Signer<'info>,
+}
+
+// Add ViewUserInfo account validation structure
+#[derive(Accounts)]
+pub struct ViewUserInfo<'info> {
+    pub user_info: Account<'info, UserInfo>,
+}
+
+// Add space calculation for Pool account
+impl Pool {
+    pub const LEN: usize = 32 + // deposit_token
+                          32 + // reward_token
+                          8 +  // minimum_deposit
+                          8 +  // lock_period
+                          1 +  // can_swap
+                          8 +  // last_rate
+                          8 +  // last_apy
+                          256 + // rates (estimated size)
+                          256;  // apys (estimated size)
+}
+
+// Add space calculation for UserInfo account
+impl UserInfo {
+    pub const LEN: usize = 8 +  // amount
+                          8 +  // pending_reward
+                          8 +  // last_claimed
+                          8 +  // total_claimed
+                          8 +  // stake_timestamp
+                          32 + // referrer
+                          512; // deposits (estimated size for vector)
+}
+
+
+
+// Complete date_helper module implementation
+pub mod date_helper {
+
+    pub fn get_start_of_date(timestamp: i64) -> i64 {
+        let seconds_per_day: i64 = 86400;
+        (timestamp / seconds_per_day) * seconds_per_day
     }
 
+    pub fn get_end_of_date(timestamp: i64) -> i64 {
+        let seconds_per_day: i64 = 86400;
+        (timestamp / seconds_per_day) * seconds_per_day + seconds_per_day - 1
+    }
 
-
-
+    pub fn get_diff_days(timestamp1: i64, timestamp2: i64) -> i64 {
+        let seconds_per_day: i64 = 86400;
+        (timestamp1 - timestamp2) / seconds_per_day
+    }
+}
+// Add UpdatePool account validation structure
 #[derive(Accounts)]
 pub struct UpdatePool<'info> {
     #[account(mut)]
-    pub authority: Signer<'info>,
-    
-    #[account(
-        mut,
-        seeds = [b"pool", authority.key().as_ref()],
-        bump = pool.bump,
-    )]
     pub pool: Account<'info, Pool>,
-}
-
-
-#[error_code]
-pub enum DextraError {
-    #[msg("Deposit amount is less than minimum required")]
-    InsufficientDeposit,
-}
-impl PoolInfo {
-    pub const LEN: usize = 32 + 32 + 8 + 8 + 1 + 8 + 8;
-}
-impl Pool {
-    pub const LEN: usize = 8 + PoolInfo::LEN;
-}
-
-impl UserInfo {
-    pub const LEN: usize = 8 + 8 + 8 + 8 + 8 + 200; // 200 for vec storage
-}
-#[error_code]
-pub enum TransferHelperError {
-    #[msg("Transfer failed")]
-    TransferFailed,
-    #[msg("Approve failed")] 
-    ApproveFailed,
-    #[msg("SOL transfer failed")]
-    SolTransferFailed,
-}
-#[error_code]
-pub enum CustomError {
-    #[msg("Unauthorized access")]
-    UnauthorizedAccess,
-}
-#[derive(Accounts)]
-pub struct MassCall<'info> {
     #[account(mut)]
+    pub protocol: Account<'info, ProtocolAccount>,
+    #[account(constraint = protocol.owner == authority.key() || protocol.governance == authority.key())]
     pub authority: Signer<'info>,
-    /// CHECK: This account just stores the governance address
-    pub governance: AccountInfo<'info>,
-}
-#[error_code]
-pub enum TransferError {
-    #[msg("Transfer failed")]
-    TransferFailed,
+    pub system_program: Program<'info, System>,
 }
 
-
-// Access control modifier as a function
-fn verify_authority(authority: &Pubkey) -> Result<()> {
-    require!(
-        *authority == OWNER_PUBKEY || *authority == GOVERNANCE_PUBKEY,
-        CustomError::UnauthorizedAccess
-    );
-    Ok(())
+// Update Deposit account validation structure with init_if_needed
+#[derive(Accounts)]
+pub struct Deposit<'info, ProtocolAccount: std::clone::Clone + anchor_lang::AccountDeserialize + anchor_lang::AccountSerialize  + anchor_lang::Owner> {
+    #[account(mut)]
+    pub pool: Account<'info, Pool>,
+    #[account(init_if_needed, payer = user, space = 8 + UserInfo::LEN)]
+    pub user_info: Account<'info, UserInfo>,
+    #[account(mut)]
+    pub protocol: Account<'info, ProtocolAccount>,
+    #[account(mut)]
+    pub user_token_account: Account<'info, TokenAccount>,
+    #[account(mut, seeds = [b"protocol_token", pool.key().as_ref()], bump)]
+    pub protocol_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
 }
 
-#[error_code]
-pub enum ErrorCode {
-    #[msg("Math overflow error")]
-    MathOverflow,
-}
 
+// Add constant for REF_PERCENT
 pub const REF_PERCENT: u64 = 200; // 2%
 
-fn process_ref<'info>(
-    pid: u64,
-    amount: u64,
-    user: Pubkey,
-    referrers: &Account<'info, Referrers>,
-    pool_info: &mut Account<'info, PoolInfo>,
-    token_program: &AccountInfo<'info>,
-    from: &Account<'info, TokenAccount>,
-    authority: &Signer<'info>,
-) -> Result<()> {
-    if referrers.get_referrer(user) != Pubkey::default() {
-        let ref_amount = (amount.checked_mul(REF_PERCENT)?)
-            .checked_div(10000)
-            .ok_or(ErrorCode::MathOverflow)?;
-            
-        safe_send_from_pool(
-            pid,
-            referrers.get_referrer(user).to_account_info(),
-            ref_amount,
-            true,
-            pool_info,
-            token_program,
-            from,
-            authority,
-        )?;
-    }
-    Ok(())
-}
-
-    fn safe_send_from_pool<'info>(
-        pid: u64,
-        to: AccountInfo<'info>,
-        amount: u64,
-        is_claim: bool,
-        pool_info: &mut Account<'info, PoolInfo>,
-        token_program: &AccountInfo<'info>,
-        from: &Account<'info, TokenAccount>,
-        authority: &Signer<'info>,
-    ) -> Result<()> {
-        let token = if is_claim {
-            pool_info.reward_token
-        } else {
-            pool_info.deposit_token
-        };
-
-        if token == Pubkey::default() {
-            safe_transfer_sol(&to, amount)
-        } else {
-            safe_transfer(
-                token_program,
-                from, 
-                &Account::<TokenAccount>::try_from(&to)?,
-                authority,
-                amount,
-            )
-        }
-    }
-
-    fn safe_transfer_sol<'info>(
-        to: &AccountInfo<'info>,
-        value: u64,
-    ) -> Result<()> {
-        let ix = solana_program::system_instruction::transfer(
-            &authority.key(),
-            &to.key(),
-            value
-        );
-
-        solana_program::program::invoke(
-            &ix,
-            &[
-                authority.to_account_info(),
-                to.clone(),
-            ],
-        ).map_err(|_| error!(TransferError::TransferFailed))
-    }
-
-    pub fn calculate_reward(pid: u64, user: Pubkey, state: &DextraState) -> Result<u64> {
-        if let Some(user_pools) = state.user_info.get(&pid) {
-            if let Some(user_info) = user_pools.get(&user) {
-                let amount = user_info.amount;
-                let last_claimed = user_info.last_claimed;
-                let total_reward = user_info.pending_reward;
-
-                if amount == 0 || last_claimed == 0 {
-                    return Ok(total_reward);
-                }
-
-                let start_timestamp = DateHelper::get_start_of_date(last_claimed);
-                let current_timestamp = Clock::get()?.unix_timestamp;
-                let mut total_time_reward: u64 = 0;
-                let mut last_claimed_temp = last_claimed;
-
-                let mut timestamp = start_timestamp;
-                while timestamp < current_timestamp {
-                    let apy = state.pool_apys
-                        .get(&pid)
-                        .and_then(|apys| apys.get(&(timestamp as u64)))
-                        .copied()
-                        .unwrap_or_else(|| pool.last_apy);
-
-                    let rate = state.pool_rates
-                        .get(&pid)
-                        .and_then(|rates| rates.get(&(timestamp as u64)))
-                        .copied()
-                        .unwrap_or_else(|| pool.last_rate);
-
-                    let end_day = timestamp + DateHelper::SECONDS_PER_DAY;
-                    let applicable_time = if end_day > current_timestamp {
-                        current_timestamp - last_claimed_temp
-                    } else {
-                        end_day - last_claimed_temp
-                    };
-
-                    let yield_amount = amount
-                        .checked_mul(applicable_time as u64)?
-                        .checked_mul(apy)?
-                        .checked_div(36500 * 86400 * 100)?;
-
-                    total_time_reward = total_time_reward
-                        .checked_add(yield_amount.checked_mul(rate)?.checked_div(1000000)?)?;
-
-                    last_claimed_temp = if end_day > current_timestamp {
-                        current_timestamp
-                    } else {
-                        end_day
-                    };
-
-                    timestamp += DateHelper::SECONDS_PER_DAY;
-                }
-
-                // Handle token decimals adjustment
-                let deposit_decimals = get_token_decimals(pool.deposit_token)?;
-                let reward_decimals = get_token_decimals(pool.reward_token)?;
-                
-                let final_reward = if reward_decimals >= deposit_decimals {
-                    total_time_reward.checked_mul(10u64.pow((reward_decimals - deposit_decimals) as u32))?
-                } else {
-                    total_time_reward.checked_div(10u64.pow((deposit_decimals - reward_decimals) as u32))?
-                };
-
-                Ok(total_reward.checked_add(final_reward)?)
-            } else {
-                Ok(0)
-            }
-        } else {
-            Ok(0)
-        }
-    }
-
-    pub fn claim(ctx: Context<Claim>) -> Result<()> {
-        // Verify claim is allowed
-        let state = &ctx.accounts.state;
-        require!(
-            state.is_claimable.get(&ctx.accounts.user.key()).copied().unwrap_or(false),
-            DextraError::ClaimNotAllowed
-        );
-
-        // Calculate reward
-        let reward = calculate_reward(
-            ctx.accounts.pool.key().to_bytes(),
-            ctx.accounts.user.key(),
-            state
-        )?;
-
-        // Transfer reward tokens
-        safe_transfer(
-            &ctx.accounts.token_program.to_account_info(),
-            &ctx.accounts.pool_token,
-            &ctx.accounts.user_token,
-            &ctx.accounts.authority,
-            reward
-        )?;
-
-        // Update user info
-        let user = &mut ctx.accounts.user_account;
-        user.pending_reward = 0;
-        user.last_claimed = Clock::get()?.unix_timestamp;
-        user.total_claimed = user.total_claimed.checked_add(reward).unwrap();
-
-        // Process referral reward
-        process_ref(
-            ctx.accounts.pool.key().to_bytes(),
-            reward,
-            ctx.accounts.user.key(),
-            &ctx.accounts.referrers,
-            &mut ctx.accounts.pool,
-            &ctx.accounts.token_program.to_account_info(),
-            &ctx.accounts.pool_token,
-            &ctx.accounts.authority,
-        )?;
-
-        emit!(ClaimEvent {
-            user: ctx.accounts.user.key(),
-            pool: ctx.accounts.pool.key(),
-            amount: reward
-        });
-
-        Ok(())
-    }
-
-    #[derive(Accounts)]
-    pub struct Claim<'info> {
-        #[account(mut)]
-        pub pool: Account<'info, Pool>,
-        #[account(mut)]
-        pub user: Signer<'info>,
-        #[account(mut)]
-        pub authority: Signer<'info>,
-        #[account(mut)]
-        pub user_account: Account<'info, UserInfo>,
-        #[account(mut)]
-        pub user_token: Account<'info, TokenAccount>,
-        #[account(mut)]
-        pub pool_token: Account<'info, TokenAccount>,
-        pub token_program: Program<'info, Token>,
-        pub state: Account<'info, DextraState>,
-        pub referrers: Account<'info, Referrers>,
-    }
-
-    #[event]
-    pub struct ClaimEvent {
-        pub user: Pubkey,
-        pub pool: Pubkey,
-        pub amount: u64,
-    }
