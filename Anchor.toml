@@ -6,7 +6,7 @@ seeds = false
 skip-lint = false
 
 [programs.localnet]
-freelance = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"
+freelance = "BhL4V5qTP33T3PyjRZbqh1ALSBmkoMMFGLv4Whrf315S"
 
 [registry]
 url = "https://api.apr.dev"
@@ -26,4 +26,4 @@ out = "target/types"
 
 [test]
 startup_wait = 5000
-validator = { url = "http://localhost:8898" }
+validator = { url = "http://127.0.0.1:8899", faucet = "http://127.0.0.1:8081" }

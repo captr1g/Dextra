@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer, Mint};
 use std::collections::HashMap;
 use anchor_lang::solana_program::system_program;
-declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+declare_id!("BhL4V5qTP33T3PyjRZbqh1ALSBmkoMMFGLv4Whrf315S");
 
 mod transfer_helper;
 
@@ -88,10 +88,25 @@ pub mod freelance {
     // Initialize the protocol
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
         let protocol = &mut ctx.accounts.protocol;
+        let user_info = &mut ctx.accounts.user_info;
+
         protocol.owner = ctx.accounts.owner.key();
         protocol.governance = ctx.accounts.owner.key();
         protocol.ref_percent = 200; // 2%
         protocol.pool_count = 0;
+        protocol.referrers = Vec::new();
+        protocol.claimable_users = Vec::new();
+        protocol.withdrawable_users = Vec::new();
+
+        user_info.authority = ctx.accounts.owner.key();
+        user_info.amount = 0;
+        user_info.stake_timestamp = 0;
+        user_info.last_claimed = 0;
+        user_info.pending_reward = 0;
+        user_info.referrer = Pubkey::default();
+        user_info.total_claimed = 0;
+        user_info.deposits = Vec::new();
+
         Ok(())
     }
 
@@ -589,50 +604,34 @@ impl Pool {
 #[account]
 #[derive(Default)]
 pub struct UserInfo {
-    pub authority: Pubkey,  // Add this field
+    pub authority: Pubkey,
     pub amount: u64,
+    pub stake_timestamp: i64,
+    pub last_claimed: u64,
     pub pending_reward: u64,
-    pub last_claimed: u64,      // Changed from u64
-    pub total_claimed: u64,
-    pub stake_timestamp: i64,   // Changed from u64
     pub referrer: Pubkey,
-    pub deposits: Vec<UserDeposit>
+    pub total_claimed: u64,
+    pub deposits: Vec<UserDeposit>,
 }
 
-// Update timestamp assignments
 impl UserInfo {
-    // Keep original LEN name since it's referenced elsewhere
-    pub const LEN: usize = 8 +    // discriminator
-                          32 +   // authority
-                          8 +    // amount
-                          8 +    // pending_reward
-                          8 +    // total_claimed
-                          8 +    // last_claimed
-                          8 +    // stake_timestamp
-                          32 +   // referrer
-                          512;   // deposits (estimated size for vector)
-    
-    pub fn new() -> Self {
-        Self {
-            authority: Pubkey::default(),
-            amount: 0,
-            pending_reward: 0,
-            last_claimed: 0,
-            total_claimed: 0,
-            stake_timestamp: 0,
-            referrer: Pubkey::default(),
-            deposits: Vec::new(),
-        }
-    }
+    pub const LEN: usize = 8 + // discriminator
+        32 + // authority
+        8 + // amount
+        8 + // stake_timestamp
+        8 + // last_claimed
+        8 + // pending_reward
+        32 + // referrer
+        8 + // total_claimed
+        4 + // vec length prefix
+        100 * std::mem::size_of::<UserDeposit>(); // space for 100 deposits
 }
 
-
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
 pub struct UserDeposit {
     pub amount: u64,
     pub timestamp: i64,
-    pub locked_until: i64,      // Changed from u64
+    pub locked_until: i64,
     pub is_withdrawn: bool,
 }
 
@@ -672,11 +671,13 @@ pub struct ClaimEvent {
 // Account validation structures
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = owner, space = 8 + ProtocolAccount::LEN)]
+    #[account(init, payer = owner, space = ProtocolAccount::LEN)]
     pub protocol: Account<'info, ProtocolAccount>,
+    #[account(init, payer = owner, space = 1000)]
+    pub user_info: Account<'info, UserInfo>,
     #[account(mut)]
     pub owner: Signer<'info>,
-    pub system_program: Program<'info, System>
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -954,18 +955,18 @@ pub struct Masscall<'info> {
 #[derive(Accounts)]
 pub struct Withdraw<'info> {
     #[account(mut)]
-    pub pool: Account<'info, Pool>,
-    #[account(mut)]
     pub protocol: Account<'info, ProtocolAccount>,
     #[account(mut)]
     pub user_info: Account<'info, UserInfo>,
     #[account(mut)]
-    pub protocol_token_account: Box<Account<'info, TokenAccount>>,
-    #[account(mut)]
-    pub user_token_account: Box<Account<'info, TokenAccount>>,
-    #[account(mut)]
     pub user: Signer<'info>,
-    pub token_program: Program<'info, Token>
+    pub pool: Account<'info, Pool>,
+    #[account(mut)]
+    pub protocol_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user_token_account: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>
 }
 
 #[derive(Accounts)]
