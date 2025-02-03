@@ -2,11 +2,36 @@ import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
 import { Freelance } from "../target/types/freelance";
 
-anchor.setProvider(anchor.AnchorProvider.env());
+// Custom provider setup with retry logic
+const setupProvider = () => {
+  const provider = anchor.AnchorProvider.env();
+  const connection = new anchor.web3.Connection(provider.connection.rpcEndpoint, {
+    commitment: "confirmed",
+    confirmTransactionInitialTimeout: 60000,
+  });
+  return new anchor.AnchorProvider(connection, provider.wallet, {
+    commitment: "confirmed",
+    preflightCommitment: "confirmed",
+  });
+};
+
+// Set custom provider
+anchor.setProvider(setupProvider());
 
 const program = anchor.workspace.Freelance as Program<Freelance>;
 
 describe("freelance", () => {
+  // Add connection check before tests
+  before(async () => {
+    const provider = anchor.AnchorProvider.env();
+    try {
+      await provider.connection.getLatestBlockhash();
+    } catch (e) {
+      console.error("Failed to connect to validator. Please ensure it's running on the correct port.");
+      throw e;
+    }
+  });
+
   const provider = anchor.AnchorProvider.env();
   const wallet = provider.wallet;
 

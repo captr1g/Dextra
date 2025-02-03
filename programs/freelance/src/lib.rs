@@ -2,12 +2,12 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer, Mint};
 use std::collections::HashMap;
 use anchor_lang::solana_program::system_program;
-declare_id!("CTGXUcNqUUzQpXd53yo5GSj5a2DBoFq4LHruQbgwUpvQ");
+declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
 mod transfer_helper;
 
 #[program]
-pub mod dextra {
+pub mod freelance {
     use super::*;
 
     pub fn pool_length(ctx: Context<ViewState>) -> Result<u64> {
@@ -54,10 +54,10 @@ pub mod dextra {
         let start_date = date_helper::get_start_of_date(timestamp);
         let pool = &ctx.accounts.pool;
         
-        let apy = pool.apys.get(&start_date).unwrap_or(&pool.last_apy);
-        let rate = pool.rates.get(&start_date).unwrap_or(&pool.last_rate);
+        let apy = pool.get_apy(start_date);
+        let rate = pool.get_rate(start_date);
         
-        Ok((*apy, *rate))
+        Ok((apy, rate))
     }
 
     pub fn get_deposit_info(
@@ -116,8 +116,8 @@ pub mod dextra {
         pool.can_swap = can_swap;
         pool.last_rate = rate;
         pool.last_apy = apy;
-        pool.rates.insert(start_date, rate);
-        pool.apys.insert(start_date, apy);
+        pool.set_rate(start_date, rate);
+        pool.set_apy(start_date, apy);
 
         protocol.pool_count += 1;
         Ok(())
@@ -184,7 +184,7 @@ pub mod dextra {
     }
 
     // Implement claim function
-    pub fn claim(ctx: Context<Claim>, pool_id: u64) -> Result<()> {
+    pub fn claim<'info>(ctx: Context<'_, '_, '_, 'info, Claim<'info>>, pool_id: u64) -> Result<()> {
         let reward = ctx.accounts.user_info.pending_reward;
         require!(reward > 0, ErrorCode::NoReward);
 
@@ -193,7 +193,7 @@ pub mod dextra {
             ctx.accounts.token_program.to_account_info(),
             Transfer {
                 from: ctx.accounts.protocol_vault.to_account_info(),
-                to: ctx.accounts.user_vault.to_account_info(),
+                to: ctx.accounts.referrer_vault.to_account_info(),
                 authority: ctx.accounts.protocol.to_account_info(),
             },
         );
@@ -202,10 +202,11 @@ pub mod dextra {
         // Process referral reward if applicable
         if ctx.accounts.user_info.referrer != Pubkey::default() {
             let ref_amount = reward
-                .checked_mul(REF_PERCENT)
+                .checked_mul(ctx.accounts.protocol.ref_percent)
                 .unwrap()
                 .checked_div(10000)
                 .unwrap();
+
             process_ref_reward(&ctx, pool_id, ref_amount, ctx.accounts.user_info.referrer)?;
         }
 
@@ -310,9 +311,7 @@ pub mod dextra {
         let timestamp = Clock::get()?.unix_timestamp;
         let start_date = date_helper::get_start_of_date(timestamp);
         
-        pool.rates.insert(start_date, new_rate);
-        pool.last_rate = new_rate;
-        
+        pool.set_rate(start_date, new_rate);
         Ok(())
     }
 
@@ -321,9 +320,7 @@ pub mod dextra {
         let timestamp = Clock::get()?.unix_timestamp;
         let start_date = date_helper::get_start_of_date(timestamp);
         
-        pool.apys.insert(start_date, new_apy);
-        pool.last_apy = new_apy;
-        
+        pool.set_apy(start_date, new_apy);
         Ok(())
     }
 
@@ -374,21 +371,21 @@ pub mod dextra {
         use super::*;
 
         #[cfg(not(feature = "production"))]
-        pub(crate) fn safe_send_from_pool(
-            _ctx: &Context<Claim>,
-            _pool: &Account<Pool>,
-            _to: &AccountInfo,
-            _amount: u64,
-            _is_claim: bool,
+        pub(crate) fn safe_send_from_pool<'info, 'a, 'b, 'c>(
+            ctx: &Context<'_, '_, '_, '_, Claim>,
+            pool: &Account<'info, Pool>,
+            _to: &AccountInfo<'info>, // Prefix with underscore to indicate unused
+            amount: u64,
+            is_claim: bool,
         ) -> Result<()> {
             Err(error!(ErrorCode::ProductionFeatureRequired))
         }
 
         #[cfg(feature = "production")]
-        pub(crate) fn safe_send_from_pool<'info, Claim:anchor_lang::Bumps, T>(
-            ctx: &Context<'_, '_, '_, 'info, T, Claim: anchor_lang::Bumps>,
+        pub(crate) fn safe_send_from_pool<'info, 'a, 'b, 'c>(
+            ctx: &Context<'_, '_, '_, 'info, Claim<'info>>,
             pool: &Account<'info, Pool>,
-            to: &AccountInfo<'info>,
+            _to: &AccountInfo<'info>, // Prefix with underscore to indicate unused
             amount: u64,
             is_claim: bool,
         ) -> Result<()> {
@@ -399,29 +396,24 @@ pub mod dextra {
             };
 
             if token == Pubkey::default() {
-                transfer_helper::safe_transfer_sol(to, &ctx.accounts.protocol.to_account_info(), amount)?;
+                transfer_helper::safe_transfer_sol(_to, &ctx.accounts.protocol.to_account_info(), amount)?
             } else {
                 let protocol_token = b"protocol_token";
                 let pool_key = pool.key();
                 let pool_key_ref = pool_key.as_ref();
-                let bump = [ctx.bumps.protocol_reward_account];
-                let seeds = [protocol_token, pool_key_ref, &bump];
-                let seeds_slice = &[&seeds[..]]; // Create a slice reference that lives long enough
+                let seeds = [protocol_token, pool_key_ref, &[ctx.bumps.protocol]];
+                let seeds_slice = &[&seeds[..]];
                 
                 let transfer_ctx = CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
                     Transfer {
-                        from: if is_claim {
-                            ctx.accounts.protocol_reward_account.to_account_info()
-                        } else {
-                            ctx.accounts.protocol_reward_account.to_account_info()
-                        },
-                        to: to.clone(),
+                        from: ctx.accounts.protocol_vault.to_account_info(),
+                        to: _to.clone(),
                         authority: ctx.accounts.protocol.to_account_info(),
                     },
                     seeds_slice,
                 );
-                token::transfer(transfer_ctx, amount)?;
+                token::transfer(transfer_ctx, amount)?
             }
             Ok(())
         }
@@ -543,12 +535,54 @@ pub struct Pool {
     pub can_swap: bool,
     pub last_rate: u64,
     pub last_apy: u64,
-    pub rates: HashMap<i64, u64>,
-    pub apys: HashMap<i64, u64>,
+    pub rates: Vec<(i64, u64)>,  // (timestamp, rate)
+    pub apys: Vec<(i64, u64)>,   // (timestamp, apy)
 }
 
 impl Pool {
-    pub const LEN: usize = 32 + 32 + 8 + 8 + 1 + 8 + 8 + 256 + 256;
+    pub const LEN: usize = 32 +  // deposit_token
+        32 +    // reward_token
+        8 +     // minimum_deposit
+        8 +     // lock_period
+        1 +     // can_swap
+        8 +     // last_rate
+        8 +     // last_apy
+        512 +   // rates vector (estimated size)
+        512;    // apys vector (estimated size)
+        
+    fn get_rate(&self, timestamp: i64) -> u64 {
+        self.rates
+            .iter()
+            .find(|(t, _)| *t == timestamp)
+            .map(|(_, r)| *r)
+            .unwrap_or(self.last_rate)
+    }
+    
+    fn get_apy(&self, timestamp: i64) -> u64 {
+        self.apys
+            .iter()
+            .find(|(t, _)| *t == timestamp)
+            .map(|(_, a)| *a)
+            .unwrap_or(self.last_apy)
+    }
+    
+    fn set_rate(&mut self, timestamp: i64, rate: u64) {
+        if let Some(pos) = self.rates.iter().position(|(t, _)| *t == timestamp) {
+            self.rates[pos] = (timestamp, rate);
+        } else {
+            self.rates.push((timestamp, rate));
+        }
+        self.last_rate = rate;
+    }
+    
+    fn set_apy(&mut self, timestamp: i64, apy: u64) {
+        if let Some(pos) = self.apys.iter().position(|(t, _)| *t == timestamp) {
+            self.apys[pos] = (timestamp, apy);
+        } else {
+            self.apys.push((timestamp, apy));
+        }
+        self.last_apy = apy;
+    }
 }
 
 // Update UserInfo struct
@@ -773,17 +807,17 @@ fn calculate_reward(_pool_id: u64, user_info: &UserInfo, pool: &Pool) -> Result<
             end_day - current_claimed
         };
 
-        let apy = pool.apys.get(&(timestamp as i64)).unwrap_or(&pool.last_apy);
-        let rate = pool.rates.get(&(timestamp as i64)).unwrap_or(&pool.last_rate);
+        let apy = pool.get_apy(timestamp as i64);
+        let rate = pool.get_rate(timestamp as i64);
 
         let yield_amount = amount
             .checked_mul(applicable_timestamp as u128).unwrap()
-            .checked_mul(*apy as u128).unwrap()
+            .checked_mul(apy as u128).unwrap()
             .checked_div(100u128 * 365u128 * 86400u128 * 100u128).unwrap();
 
         total_time_reward = total_time_reward
             .checked_add((yield_amount as u64)
-                .checked_mul(*rate).unwrap()
+                .checked_mul(rate).unwrap()
                 .checked_div(1_000_000).unwrap())
             .unwrap();
 
@@ -803,7 +837,7 @@ fn calculate_reward(_pool_id: u64, user_info: &UserInfo, pool: &Pool) -> Result<
 fn calculate_swap(pool: &Pool, amount: u64, direction: bool) -> Result<u64> {
     let timestamp = Clock::get()?.unix_timestamp;
     let start_date = date_helper::get_start_of_date(timestamp);
-    let rate = *pool.rates.get(&start_date).unwrap_or(&pool.last_rate);
+    let rate = pool.get_rate(start_date);
     
     let received_amount = if direction {
         amount.checked_mul(1_000_000).unwrap().checked_div(rate).unwrap()
@@ -895,16 +929,18 @@ pub struct ViewPool<'info> {
 #[instruction(pool_id: u64)]
 pub struct Claim<'info> {
     pub pool: Account<'info, Pool>,
-    pub protocol: Account<'info, ProtocolAccount>,  // Changed from generic protocol to ProtocolAccount
+    #[account(mut, seeds = [b"protocol"], bump)]
+    pub protocol: Account<'info, ProtocolAccount>,
     pub user_info: Account<'info, UserInfo>,
     #[account(mut)]
     pub protocol_vault: Account<'info, TokenAccount>,
     #[account(mut)]
-    pub user_vault: Account<'info, TokenAccount>,
-    pub referrer_reward_account: Account<'info, TokenAccount>,
+    pub referrer_vault: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
+
+
 
 #[derive(Accounts)]
 pub struct Masscall<'info> {
@@ -970,66 +1006,67 @@ pub struct SendFromPool<'info> {
     #[account(mut)]
     pub protocol: Account<'info, ProtocolAccount>,
     #[account(mut)]
-    pub protocol_reward_account: Account<'info, TokenAccount>,
+    pub protocol_vault: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
 }
 
-// Implementation without complex generic parameters
-impl<'info> SendFromPool<'info> {
-    #[cfg(not(feature = "production"))]
-    pub(crate) fn safe_send_from_pool(
-        ctx: &Context<SendFromPool>,
-        amount: u64,
-        is_claim: bool,
-    ) -> Result<()> {
-        Err(error!(ErrorCode::ProductionFeatureRequired))
-    }
+#[cfg(feature = "production")]
+pub(crate) fn safe_send_from_pool<'info, 'a, 'b, 'c>(
+    ctx: &Context<'_, '_, '_, 'info, Claim<'info>>,
+    pool: &Account<'info, Pool>,
+    to: &AccountInfo<'info>,
+    amount: u64,
+    is_claim: bool,
+) -> Result<()> {
+    let token = if is_claim {
+        pool.reward_token
+    } else {
+        pool.deposit_token
+    };
 
-    #[cfg(feature = "production")]
-    pub(crate) fn safe_send_from_pool(
-        ctx: &Context<SendFromPool>,
-        amount: u64,
-        is_claim: bool,
-    ) -> Result<()> {
-        let pool = &ctx.accounts.pool;
-        let token = if is_claim {
-            pool.reward_token
-        } else {
-            pool.deposit_token
-        };
-
-        if token == Pubkey::default() {
-            transfer_helper::safe_transfer_sol(
-                &ctx.accounts.protocol_reward_account.to_account_info(),
-                &ctx.accounts.protocol.to_account_info(),
-                amount
-            )?;
-        }
+    if token == Pubkey::default() {
+        transfer_helper::safe_transfer_sol(to, &ctx.accounts.protocol.to_account_info(), amount)?
+    } else {
+        let protocol_token = b"protocol_token";
+        let pool_key = pool.key();
+        let pool_key_ref = pool_key.as_ref();
+        let seeds = [protocol_token, pool_key_ref, &[ctx.bumps.protocol]];
+        let seeds_slice = &[&seeds[..]];
         
-        Ok(())
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.protocol_vault.to_account_info(),
+                to: to.clone(),
+                authority: ctx.accounts.protocol.to_account_info(),
+            },
+            seeds_slice,
+        );
+        token::transfer(transfer_ctx, amount)?
     }
+    Ok(())
 }
 
 #[derive(Accounts)]
 pub struct SafeSendFromPool<'info> {
     #[account(mut)]
     pub pool: Account<'info, Pool>,
-    #[account(mut)]
+    #[account(mut, seeds = [b"protocol"], bump)]
     pub protocol: Account<'info, ProtocolAccount>,
     #[account(mut)]
     pub protocol_reward_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
 }
 
-// Remove complex generic parameters and use simpler approach
 impl<'info> SafeSendFromPool<'info> {
     #[cfg(not(feature = "production"))]
     pub(crate) fn execute(
         ctx: &Context<SafeSendFromPool>,
-        _pool: &Account<Pool>,
-        _to: &AccountInfo,
-        _amount: u64,
-        _is_claim: bool,
+        pool: &Account<Pool>,
+        to: &AccountInfo,
+        amount: u64,
+        is_claim: bool,
     ) -> Result<()> {
         Err(error!(ErrorCode::ProductionFeatureRequired))
     }
@@ -1037,45 +1074,58 @@ impl<'info> SafeSendFromPool<'info> {
     #[cfg(feature = "production")]
     pub(crate) fn execute(
         ctx: &Context<SafeSendFromPool>,
-        pool: &Account<'info, Pool>,
-        to: &AccountInfo<'info>,
+        pool: &Account<Pool>,
+        to: &AccountInfo,
         amount: u64,
         is_claim: bool,
     ) -> Result<()> {
         let token = if is_claim {
             pool.reward_token
         } else {
-            pool.deposit_token
+            ctx.accounts.pool.deposit_token
         };
 
         if token == Pubkey::default() {
-            transfer_helper::safe_transfer_sol(
-                to,
-                &ctx.accounts.protocol.to_account_info(),
-                amount
-            )?;
+            transfer_helper::safe_transfer_sol(&ctx.accounts.protocol_reward_account.to_account_info(), &ctx.accounts.protocol.to_account_info(), amount)?
         } else {
             let protocol_token = b"protocol_token";
-            let pool_key = pool.key();
-            // ... rest of your implementation
+            let pool_key = ctx.accounts.pool.key();
+            let pool_key_ref = pool_key.as_ref();
+            let seeds = [protocol_token, pool_key_ref, &[ctx.bumps.protocol]];
+            let seeds_slice = &[&seeds[..]];
+            
+            let transfer_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.protocol_reward_account.to_account_info(),
+                    to: ctx.accounts.protocol_reward_account.to_account_info(),
+                    authority: ctx.accounts.protocol.to_account_info(),
+                },
+                seeds_slice,
+            );
+            token::transfer(transfer_ctx, amount)?
         }
         Ok(())
     }
 }
 
 #[derive(Accounts)]
+#[instruction(pool_id: u64)]
 pub struct ProcessRefReward<'info> {
-    #[account(mut)]
+    pub pool: Account<'info, Pool>,
+    #[account(mut, seeds = [b"protocol"], bump)]
     pub protocol: Account<'info, ProtocolAccount>,
+    pub user_info: Account<'info, UserInfo>,
     #[account(mut)]
-    pub protocol_reward_account: Account<'info, TokenAccount>,
+    pub protocol_vault: Account<'info, TokenAccount>,
     #[account(mut)]
-    pub referrer_reward_account: Account<'info, TokenAccount>,
+    pub referrer_vault: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
 }
 
-pub fn process_ref_reward(
-    ctx: Context<ProcessRefReward>,
+pub fn process_ref_reward<'info>(
+    ctx: &Context<'_, '_, '_, 'info, Claim<'info>>,
     _pool_id: u64,
     ref_amount: u64,
     referrer: Pubkey,
@@ -1084,12 +1134,12 @@ pub fn process_ref_reward(
         let transfer_ctx = CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
-                from: ctx.accounts.protocol_reward_account.to_account_info(),
-                to: ctx.accounts.referrer_reward_account.to_account_info(),
+                from: ctx.accounts.protocol_vault.to_account_info(),
+                to: ctx.accounts.referrer_vault.to_account_info(),
                 authority: ctx.accounts.protocol.to_account_info(),
             },
         );
-        token::transfer(transfer_ctx, ref_amount)?;
+        token::transfer(transfer_ctx, ref_amount)?
     }
     Ok(())
 }
