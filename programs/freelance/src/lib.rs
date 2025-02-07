@@ -1125,22 +1125,24 @@ pub struct ProcessRefReward<'info> {
     pub system_program: Program<'info, System>,
 }
 
+// Updated process_ref_reward implementation:
 pub fn process_ref_reward<'info>(
-    ctx: &Context<'_, '_, '_, 'info, Claim<'info>>,
+    ctx: &Context<Claim<'info>>,
     _pool_id: u64,
     ref_amount: u64,
     referrer: Pubkey,
 ) -> Result<()> {
     if referrer != Pubkey::default() {
+        msg!("Processing referral reward: transferring {} tokens to referrer {}", ref_amount, referrer);
         let transfer_ctx = CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
+                authority: ctx.accounts.protocol.to_account_info(),
                 from: ctx.accounts.protocol_vault.to_account_info(),
                 to: ctx.accounts.referrer_vault.to_account_info(),
-                authority: ctx.accounts.protocol.to_account_info(),
             },
         );
-        token::transfer(transfer_ctx, ref_amount)?
+        token::transfer(transfer_ctx, ref_amount)?;
     }
     Ok(())
 }

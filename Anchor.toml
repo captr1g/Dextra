@@ -12,7 +12,7 @@ freelance = "BhL4V5qTP33T3PyjRZbqh1ALSBmkoMMFGLv4Whrf315S"
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "localnet"
+cluster = "http://127.0.0.1:8898"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
@@ -26,4 +26,4 @@ out = "target/types"
 
 [test]
 startup_wait = 5000
-validator = { url = "http://127.0.0.1:8899", faucet = "http://127.0.0.1:8081" }
+validator = { url = "http://127.0.0.1:8898", faucet = "http://127.0.0.1:8081" }
