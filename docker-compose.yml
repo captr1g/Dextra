@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  dextra:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dextra
+    container_name: dextra
+    volumes:
+      - .:/app
+      - dextra-data:/root
+    ports:
+      - "8899:8899"  # Solana validator RPC
+      - "8900:8900"  # Solana validator websocket
+      - "9900:9900"  # Solana validator gossip
+    command: shell
+    stdin_open: true
+    tty: true
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dextra
+    container_name: dextra-test
+    volumes:
+      - .:/app
+      - dextra-data:/root
+    command: test
+    depends_on:
+      - validator
+
+  validator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dextra
+    container_name: dextra-validator
+    volumes:
+      - .:/app
+      - dextra-data:/root
+    ports:
+      - "8899:8899"  # Solana validator RPC
+      - "8900:8900"  # Solana validator websocket
+      - "9900:9900"  # Solana validator gossip
+    command: validator
+    
+volumes:
+  dextra-data: 

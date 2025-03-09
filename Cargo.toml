@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "programs/dextra",
+    "programs/governance",
 ]
 resolver = "2"
 

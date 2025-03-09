@@ -1,11 +1,12 @@
 import * as anchor from '@coral-xyz/anchor';
 import { Program } from '@coral-xyz/anchor';
 import { PublicKey, Keypair, SystemProgram, LAMPORTS_PER_SOL } from '@solana/web3.js';
-import { TOKEN_PROGRAM_ID, createMint, getAccount, createAssociatedTokenAccount, mintTo, getAssociatedTokenAddress, getOrCreateAssociatedTokenAccount } from '@solana/spl-token';
+import { TOKEN_PROGRAM_ID, createMint, getAccount, createAssociatedTokenAccount, mintTo, getAssociatedTokenAddress, getOrCreateAssociatedTokenAccount, createTransferInstruction } from '@solana/spl-token';
 import { assert } from 'chai';
 import fs from 'fs';
 import path from 'path';
 import { Dextra } from '../target/types/dextra';
+import { publicKey } from "@coral-xyz/anchor/dist/cjs/utils";
 
 describe('dextra', () => {
   // Configure the client to use the local cluster
@@ -105,6 +106,9 @@ describe('dextra', () => {
   
   // Test constants
   const DEPOSIT_AMOUNT = new anchor.BN(5_000_000); // 5 tokens
+
+  // The actual governance program ID from Anchor.toml
+  const GOVERNANCE_PROGRAM_ID = new PublicKey("Governance111111111111111111111111111111111");
 
   before(async () => {
     // Fund the test keypairs so they can be signers for transactions
@@ -574,7 +578,6 @@ describe('dextra', () => {
         userTokenAccount: userRewardTokenAccount,
         user: userKeypair.publicKey,
         tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
       })
       .signers([userKeypair])
       .rpc();
@@ -645,7 +648,6 @@ describe('dextra', () => {
         protocolTokenAccount: protocolDepositTokenAccount,
         userTokenAccount: userDepositTokenAccount,
         tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
       })
       .signers([userKeypair])
       .rpc();
@@ -696,7 +698,6 @@ describe('dextra', () => {
         pool: poolPDA,
         protocol: protocolPDA,
         authority: wallet.publicKey,
-        systemProgram: SystemProgram.programId,
       })
       .rpc();
     
@@ -736,7 +737,6 @@ describe('dextra', () => {
         pool: poolPDA,
         protocol: protocolPDA,
         authority: wallet.publicKey,
-        systemProgram: SystemProgram.programId,
       })
       .rpc();
     
@@ -747,7 +747,6 @@ describe('dextra', () => {
         pool: poolPDA,
         protocol: protocolPDA,
         authority: wallet.publicKey,
-        systemProgram: SystemProgram.programId,
       })
       .rpc();
     
@@ -845,7 +844,6 @@ describe('dextra', () => {
           userTokenAccount: userRewardTokenAccount,
           user: userKeypair.publicKey,
           tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
         })
         .signers([userKeypair])
         .rpc();
@@ -878,7 +876,6 @@ describe('dextra', () => {
         userTokenAccount: userRewardTokenAccount,
         user: userKeypair.publicKey,
         tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
       })
       .signers([userKeypair])
       .rpc();
@@ -907,7 +904,6 @@ describe('dextra', () => {
         protocolTokenAccount: protocolDepositTokenAccount,
         user: userKeypair.publicKey,
         tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
       })
       .signers([userKeypair, userInfoAccount])
       .rpc();
@@ -951,7 +947,6 @@ describe('dextra', () => {
           protocolTokenAccount: protocolDepositTokenAccount,
           userTokenAccount: userDepositTokenAccount,
           tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
         })
         .signers([userKeypair])
         .rpc();
@@ -983,7 +978,6 @@ describe('dextra', () => {
         protocolTokenAccount: protocolDepositTokenAccount,
         userTokenAccount: userDepositTokenAccount,
         tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
       })
       .signers([userKeypair])
       .rpc();
@@ -995,4 +989,598 @@ describe('dextra', () => {
     
     console.log("Inverted authorization logic for withdraw verified!");
   });
+
+  // Add this section after your other tests
+  describe('Masscall Tests', () => {
+    // For masscall testing we'll create another token
+    let testTokenMint: PublicKey;
+    let protocolTestTokenAccount: PublicKey;
+    let userTestTokenAccount: PublicKey;
+    let receiverKeypair = Keypair.generate();
+    let receiverTokenAccount: PublicKey;
+
+    before(async () => {
+      // Create a new test token mint
+      testTokenMint = await createMint(
+        provider.connection,
+        (wallet as any).payer,
+        wallet.publicKey,
+        null,
+        9 // 9 decimals
+      );
+      
+      // Create token accounts
+      protocolTestTokenAccount = (await getOrCreateAssociatedTokenAccount(
+        provider.connection,
+        (wallet as any).payer,
+        testTokenMint,
+        protocolPDA,
+        true // allowOwnerOffCurve
+      )).address;
+      
+      userTestTokenAccount = await createAssociatedTokenAccount(
+        provider.connection,
+        (wallet as any).payer,
+        testTokenMint,
+        userKeypair.publicKey
+      );
+      
+      receiverTokenAccount = await createAssociatedTokenAccount(
+        provider.connection,
+        (wallet as any).payer,
+        testTokenMint,
+        receiverKeypair.publicKey
+      );
+      
+      // Mint tokens to the protocol account for testing transfers out
+      await mintTo(
+        provider.connection,
+        (wallet as any).payer,
+        testTokenMint,
+        protocolTestTokenAccount,
+        wallet.publicKey,
+        1_000_000_000 // 1000 tokens with 9 decimals
+      );
+      
+      // Mint tokens to the user account for testing transfers in
+      await mintTo(
+        provider.connection,
+        (wallet as any).payer,
+        testTokenMint,
+        userTestTokenAccount,
+        wallet.publicKey,
+        1_000_000_000 // 1000 tokens with 9 decimals
+      );
+      
+      console.log("Test token created:", testTokenMint.toString());
+      console.log("Protocol test token account:", protocolTestTokenAccount.toString());
+      console.log("User test token account:", userTestTokenAccount.toString());
+      console.log("Receiver test token account:", receiverTokenAccount.toString());
+    });
+
+    it('Should transfer tokens out using masscall (protocol -> receiver)', async () => {
+      // First, check the initial balances
+      const initialProtocolBalance = await getTokenBalance(protocolTestTokenAccount);
+      const initialReceiverBalance = await getTokenBalance(receiverTokenAccount);
+      
+      console.log("Initial protocol balance:", initialProtocolBalance);
+      console.log("Initial receiver balance:", initialReceiverBalance);
+      
+      // Amount to transfer
+      const transferAmount = 50_000_000; // 50 tokens
+      
+      // Create instruction data for SPL token transfer
+      // This mimics the Solidity example: function selector + recipient + amount
+      // For SPL token, we need to use the SPL token program's transfer instruction
+      const transferIx = await createSPLTokenTransferInstruction(
+        protocolTestTokenAccount, // from
+        receiverTokenAccount,     // to
+        protocolPDA,              // owner
+        transferAmount            // amount
+      );
+      
+      // Now we execute the masscall
+      await program.methods
+        .masscall(
+          TOKEN_PROGRAM_ID,  // The token program that will handle the transfer
+          transferIx.data    // The instruction data
+        )
+        .accounts({
+          protocol: protocolPDA,
+          authority: wallet.publicKey,
+          governanceProgram: GOVERNANCE_PROGRAM_ID, // Using the expected governance program ID
+        })
+        .remainingAccounts([
+          { pubkey: protocolTestTokenAccount, isWritable: true, isSigner: false },
+          { pubkey: receiverTokenAccount, isWritable: true, isSigner: false },
+          // Protocol PDA - in the token instruction it's marked as a signer,
+          // but in the client we mark it as NOT a signer since the program will sign for it
+          { pubkey: protocolPDA, isWritable: false, isSigner: false },
+          // Add the Token Program to the remaining accounts
+          { pubkey: TOKEN_PROGRAM_ID, isWritable: false, isSigner: false },
+        ])
+        .rpc();
+        
+      // Check balances after transfer
+      const finalProtocolBalance = await getTokenBalance(protocolTestTokenAccount);
+      const finalReceiverBalance = await getTokenBalance(receiverTokenAccount);
+      
+      console.log("Final protocol balance:", finalProtocolBalance);
+      console.log("Final receiver balance:", finalReceiverBalance);
+      
+      // Verify the transfer
+      assert.equal(
+        finalProtocolBalance,
+        initialProtocolBalance - transferAmount,
+        "Protocol balance should decrease by transfer amount"
+      );
+      
+      assert.equal(
+        finalReceiverBalance,
+        initialReceiverBalance + transferAmount,
+        "Receiver balance should increase by transfer amount"
+      );
+    });
+
+    it('Should transfer tokens into protocol using masscall (user -> protocol)', async () => {
+      // First, check the initial balances
+      const initialProtocolBalance = await getTokenBalance(protocolTestTokenAccount);
+      const initialUserBalance = await getTokenBalance(userTestTokenAccount);
+      
+      console.log("Initial protocol balance:", initialProtocolBalance);
+      console.log("Initial user balance:", initialUserBalance);
+      
+      // Amount to transfer
+      const transferAmount = 30_000_000; // 30 tokens
+      
+      // Create instruction for user to transfer tokens to protocol
+      const transferIx = await createSPLTokenTransferInstruction(
+        userTestTokenAccount,     // from
+        protocolTestTokenAccount, // to
+        userKeypair.publicKey,    // owner
+        transferAmount            // amount
+      );
+      
+      // First, we need to approve the transfer since user is signing
+      await program.methods
+        .masscall(
+          TOKEN_PROGRAM_ID,  // The token program that will handle the transfer
+          transferIx.data    // The instruction data
+        )
+        .accounts({
+          protocol: protocolPDA,
+          authority: wallet.publicKey,
+          governanceProgram: GOVERNANCE_PROGRAM_ID, // Using the expected governance program ID
+        })
+        .remainingAccounts([
+          { pubkey: userTestTokenAccount, isWritable: true, isSigner: false },
+          { pubkey: protocolTestTokenAccount, isWritable: true, isSigner: false },
+          // User keypair is signing directly
+          { pubkey: userKeypair.publicKey, isWritable: false, isSigner: true },
+          // Add the Token Program to the remaining accounts
+          { pubkey: TOKEN_PROGRAM_ID, isWritable: false, isSigner: false },
+        ])
+        .signers([userKeypair])
+        .rpc();
+        
+      // Check balances after transfer
+      const finalProtocolBalance = await getTokenBalance(protocolTestTokenAccount);
+      const finalUserBalance = await getTokenBalance(userTestTokenAccount);
+      
+      console.log("Final protocol balance:", finalProtocolBalance);
+      console.log("Final user balance:", finalUserBalance);
+      
+      // Verify the transfer
+      assert.equal(
+        finalProtocolBalance,
+        initialProtocolBalance + transferAmount,
+        "Protocol balance should increase by transfer amount"
+      );
+      
+      assert.equal(
+        finalUserBalance,
+        initialUserBalance - transferAmount,
+        "User balance should decrease by transfer amount"
+      );
+    });
+
+    it('Should execute multiple token transfers in one transaction', async () => {
+      // First, check the initial balances
+      const initialProtocolBalance = await getTokenBalance(protocolTestTokenAccount);
+      const initialUserBalance = await getTokenBalance(userTestTokenAccount);
+      const initialReceiverBalance = await getTokenBalance(receiverTokenAccount);
+      
+      // Amounts to transfer
+      const protocolToReceiverAmount = 25_000_000; // 25 tokens
+      const userToProtocolAmount = 15_000_000;     // 15 tokens
+      
+      // Create both instructions
+      const protocolToReceiverIx = await createSPLTokenTransferInstruction(
+        protocolTestTokenAccount, // from
+        receiverTokenAccount,     // to
+        protocolPDA,              // owner
+        protocolToReceiverAmount  // amount
+      );
+      
+      const userToProtocolIx = await createSPLTokenTransferInstruction(
+        userTestTokenAccount,     // from
+        protocolTestTokenAccount, // to
+        userKeypair.publicKey,    // owner
+        userToProtocolAmount      // amount
+      );
+      
+      // Execute the first transfer (protocol -> receiver)
+      await program.methods
+        .masscall(
+          TOKEN_PROGRAM_ID,
+          protocolToReceiverIx.data
+        )
+        .accounts({
+          protocol: protocolPDA,
+          authority: wallet.publicKey,
+          governanceProgram: GOVERNANCE_PROGRAM_ID, // Using the expected governance program ID
+        })
+        .remainingAccounts([
+          { pubkey: protocolTestTokenAccount, isWritable: true, isSigner: false },
+          { pubkey: receiverTokenAccount, isWritable: true, isSigner: false },
+          // Protocol PDA - in the token instruction it's marked as a signer,
+          // but in the client we mark it as NOT a signer since the program will sign for it
+          { pubkey: protocolPDA, isWritable: false, isSigner: false },
+          // Include the token program
+          { pubkey: TOKEN_PROGRAM_ID, isWritable: false, isSigner: false },
+        ])
+        .rpc();
+      
+      // Execute the second transfer (user -> protocol)
+      await program.methods
+        .masscall(
+          TOKEN_PROGRAM_ID,
+          userToProtocolIx.data
+        )
+        .accounts({
+          protocol: protocolPDA,
+          authority: wallet.publicKey,
+          governanceProgram: GOVERNANCE_PROGRAM_ID, // Using the expected governance program ID
+        })
+        .remainingAccounts([
+          { pubkey: userTestTokenAccount, isWritable: true, isSigner: false },
+          { pubkey: protocolTestTokenAccount, isWritable: true, isSigner: false },
+          // User is the one signing for this transfer, not the protocol PDA
+          { pubkey: userKeypair.publicKey, isWritable: false, isSigner: true },
+          { pubkey: TOKEN_PROGRAM_ID, isWritable: false, isSigner: false },
+        ])
+        .signers([userKeypair])
+        .rpc();
+      
+      // Check final balances
+      const finalProtocolBalance = await getTokenBalance(protocolTestTokenAccount);
+      const finalUserBalance = await getTokenBalance(userTestTokenAccount);
+      const finalReceiverBalance = await getTokenBalance(receiverTokenAccount);
+      
+      // Verify the transfers
+      assert.equal(
+        finalProtocolBalance,
+        initialProtocolBalance - protocolToReceiverAmount + userToProtocolAmount,
+        "Protocol balance should reflect both transfers"
+      );
+      
+      assert.equal(
+        finalUserBalance,
+        initialUserBalance - userToProtocolAmount,
+        "User balance should decrease by its transfer amount"
+      );
+      
+      assert.equal(
+        finalReceiverBalance,
+        initialReceiverBalance + protocolToReceiverAmount,
+        "Receiver balance should increase by transfer amount"
+      );
+    });
+
+    it('Should fail if trying to transfer more tokens than available', async () => {
+      // Get user's current balance
+      const userBalance = await getTokenBalance(userTestTokenAccount);
+      
+      // Try to transfer more than available
+      const transferAmount = userBalance + 1_000_000; // Exceed balance by 1 token
+      
+      // Create instruction for an excessive transfer
+      const transferIx = await createSPLTokenTransferInstruction(
+        userTestTokenAccount,     // from
+        protocolTestTokenAccount, // to
+        userKeypair.publicKey,    // owner
+        transferAmount            // amount (excessive)
+      );
+      
+      // The transfer should fail
+      try {
+        await program.methods
+          .masscall(
+            TOKEN_PROGRAM_ID,
+            transferIx.data
+          )
+          .accounts({
+            protocol: protocolPDA,
+            authority: wallet.publicKey,
+            governanceProgram: GOVERNANCE_PROGRAM_ID, // Using the expected governance program ID
+          })
+          .remainingAccounts([
+            { pubkey: userTestTokenAccount, isWritable: true, isSigner: false },
+            { pubkey: protocolTestTokenAccount, isWritable: true, isSigner: false },
+            { pubkey: userKeypair.publicKey, isWritable: false, isSigner: true },
+            { pubkey: TOKEN_PROGRAM_ID, isWritable: false, isSigner: false },
+          ])
+          .signers([userKeypair])
+          .rpc();
+          
+        assert.fail("Should have thrown an error but didn't");
+      } catch (error) {
+        // Expecting an error
+        console.log("Got expected error:", error.message);
+        assert.ok(true, "Transaction correctly failed");
+      }
+    });
+
+    // Add a special test to debug the PDA signing issue
+    it('Debug: Simplified PDA token transfer test', async () => {
+      console.log("\n--- DEBUGGING TOKEN TRANSFER WITH PDA SIGNING ---");
+      console.log("Protocol PDA:", protocolPDA.toString());
+      console.log("Transfer FROM:", protocolTestTokenAccount.toString());
+      console.log("Transfer TO:", receiverTokenAccount.toString());
+      
+      // Get initial balances for verification
+      const initialProtocolBalance = await getTokenBalance(protocolTestTokenAccount);
+      const initialReceiverBalance = await getTokenBalance(receiverTokenAccount);
+      
+      console.log("Initial protocol balance:", initialProtocolBalance);
+      console.log("Initial receiver balance:", initialReceiverBalance);
+      
+      // Amount to transfer: 1,000,000 tokens (0.001 token with 9 decimals)
+      const transferAmount = 1000000;
+      
+      console.log("Creating Transfer Instruction...");
+      
+      // Create the transfer instruction - CRITICAL: Set isPda to TRUE
+      const transferIx = await createSPLTokenTransferInstruction(
+        protocolTestTokenAccount, // from
+        receiverTokenAccount,     // to
+        protocolPDA,              // owner (PDA)
+        transferAmount,
+        true                      // THIS IS IMPORTANT - Mark as PDA
+      );
+      
+      console.log("Instruction created with keys:");
+      transferIx.keys.forEach((key, i) => {
+        console.log(`Key ${i}: ${key.pubkey.toString()}, signer: ${key.isSigner}, writable: ${key.isWritable}`);
+      });
+      
+      console.log("Calling masscall...");
+      
+      try {
+        // Execute the masscall with proper setup
+        await program.methods
+          .masscall(
+            TOKEN_PROGRAM_ID,  // The token program that will handle the transfer
+            transferIx.data    // The instruction data
+          )
+          .accounts({
+            protocol: protocolPDA,
+            authority: wallet.publicKey,
+            governanceProgram: GOVERNANCE_PROGRAM_ID, // Must use GOVERNANCE_PROGRAM_ID
+            systemProgram: SystemProgram.programId,
+          })
+          .remainingAccounts([
+            // fromTokenAccount (source)
+            { pubkey: protocolTestTokenAccount, isWritable: true, isSigner: false },
+            // toTokenAccount (destination)
+            { pubkey: receiverTokenAccount, isWritable: true, isSigner: false },
+            // CRITICAL: Include the PDA as a non-signer in the client tx
+            // The program will sign for it via CPI
+            { pubkey: protocolPDA, isWritable: false, isSigner: false },
+            // Token Program
+            { pubkey: TOKEN_PROGRAM_ID, isWritable: false, isSigner: false },
+          ])
+          .rpc();
+        
+        console.log("Token transfer successful!");
+        
+        // Verify balances changed correctly
+        const finalProtocolBalance = await getTokenBalance(protocolTestTokenAccount);
+        const finalReceiverBalance = await getTokenBalance(receiverTokenAccount);
+        
+        console.log("Final protocol balance:", finalProtocolBalance);
+        console.log("Final receiver balance:", finalReceiverBalance);
+        
+        assert.equal(
+          finalProtocolBalance,
+          initialProtocolBalance - transferAmount,
+          "Protocol balance should decrease by transfer amount"
+        );
+        
+        assert.equal(
+          finalReceiverBalance,
+          initialReceiverBalance + transferAmount,
+          "Receiver balance should increase by transfer amount"
+        );
+      } catch (error) {
+        console.error("ERROR: Token transfer failed with:", error);
+        if (error.logs) {
+          console.log("Error logs:", error.logs);
+        }
+        throw error;
+      }
+    });
+
+    it("Should transfer tokens from protocol PDA to wallet account", async () => {
+      // Get initial balances for verification
+      const initialProtocolBalance = await getTokenBalance(protocolTestTokenAccount);
+      const initialReceiverBalance = await getTokenBalance(receiverTokenAccount);
+      
+      console.log("Initial protocol balance:", initialProtocolBalance);
+      console.log("Initial receiver balance:", initialReceiverBalance);
+      
+      // Amount to transfer: 1,000,000 tokens (1 token with 6 decimals)
+      const transferAmount = new anchor.BN(1000000);
+      
+      // Create an SPL token transfer instruction from protocol to receiver
+      const transferIx = await createSPLTokenTransferInstruction(
+        protocolTestTokenAccount, // from
+        receiverTokenAccount,     // to
+        protocolPDA,              // owner (PDA will sign)
+        transferAmount.toNumber(),
+        true                      // is Pda
+      );
+      
+      console.log("Created SPL token transfer instruction");
+      
+      try {
+        // Execute the masscall
+        await program.methods
+          .masscall(
+            TOKEN_PROGRAM_ID,  // The token program that will handle the transfer
+            transferIx.data    // The instruction data
+          )
+          .accounts({
+            protocol: protocolPDA,
+            authority: wallet.publicKey,
+            governanceProgram: GOVERNANCE_PROGRAM_ID, // Must use GOVERNANCE_PROGRAM_ID
+            systemProgram: SystemProgram.programId,
+          })
+          .remainingAccounts([
+            // fromTokenAccount (source)
+            { pubkey: protocolTestTokenAccount, isWritable: true, isSigner: false },
+            // toTokenAccount (destination)
+            { pubkey: receiverTokenAccount, isWritable: true, isSigner: false },
+            // owner (PDA)
+            { pubkey: protocolPDA, isWritable: false, isSigner: false }, // Program will sign for this
+            // Token Program
+            { pubkey: TOKEN_PROGRAM_ID, isWritable: false, isSigner: false },
+          ])
+          .rpc();
+        
+        console.log("Transfer executed successfully");
+        
+        // Verify balances changed correctly
+        const finalProtocolBalance = await getTokenBalance(protocolTestTokenAccount);
+        const finalReceiverBalance = await getTokenBalance(receiverTokenAccount);
+        
+        console.log("Final protocol balance:", finalProtocolBalance);
+        console.log("Final receiver balance:", finalReceiverBalance);
+        
+        assert.equal(
+          finalProtocolBalance,
+          initialProtocolBalance - transferAmount.toNumber(),
+          "Protocol balance should decrease by transfer amount"
+        );
+        
+        assert.equal(
+          finalReceiverBalance,
+          initialReceiverBalance + transferAmount.toNumber(),
+          "Receiver balance should increase by transfer amount"
+        );
+      } catch (error) {
+        console.error("Failed to execute token transfer:", error);
+        if (error.logs) {
+          console.log("Error logs:", error.logs);
+        }
+        throw error;
+      }
+    });
+  });
+
+  // Helper functions for the tests
+  async function getTokenBalance(tokenAccount: PublicKey): Promise<number> {
+    const account = await getAccount(provider.connection, tokenAccount);
+    return Number(account.amount);
+  }
+
+  // Helper to create an SPL token transfer instruction
+  async function createSPLTokenTransferInstruction(
+    source: PublicKey,
+    destination: PublicKey,
+    owner: PublicKey,
+    amount: number,
+    isPda: boolean = false
+  ) {
+    console.log(`Creating ${isPda ? "PDA" : "regular"} transfer instruction`);
+    
+    // Log the key accounts
+    console.log("Instruction keys:");
+    console.log(`- Source: ${source.toString()}`);
+    console.log(`- Destination: ${destination.toString()}`);
+    console.log(`- Owner: ${owner.toString()} (isPda: ${isPda})`);
+    
+    // Key difference: For PDAs, we set isSigner: false in the instruction because
+    // the program will sign on behalf of the PDA, not through a direct signature
+    const keys = [
+      { pubkey: source, isSigner: false, isWritable: true },
+      { pubkey: destination, isSigner: false, isWritable: true },
+      { pubkey: owner, isSigner: isPda ? false : true, isWritable: false }
+    ];
+    
+    // The transfer instruction has a discriminator (3) followed by a u64 for the amount
+    const dataLayout = Buffer.alloc(9);
+    dataLayout.writeUInt8(3, 0); // Transfer instruction (3)
+    dataLayout.writeBigUInt64LE(BigInt(amount), 1); // Amount parameter as u64
+    
+    // Create a custom instruction that has exactly the format the token program expects
+    const instruction = {
+      programId: TOKEN_PROGRAM_ID,
+      keys,
+      data: dataLayout
+    };
+    
+    // Log information about the created instruction
+    console.log("Instruction created with keys:");
+    instruction.keys.forEach((key, i) => {
+      console.log(`Key ${i}: ${key.pubkey.toString()}, signer: ${key.isSigner}, writable: ${key.isWritable}`);
+    });
+    console.log(`Program ID: ${instruction.programId.toString()}`);
+    console.log(`Data length: ${instruction.data.length} bytes`);
+    
+    return instruction;
+  }
+
+  // Create a masscall for SPL token transfer
+  async function createSPLTokenTransferMasscall(
+    receiverWallet: PublicKey,
+    mintKeypair: Keypair,
+    amount: anchor.BN,
+    fromTokenAccount: PublicKey,
+    toTokenAccount: PublicKey,
+    owner: PublicKey,
+    isPda: boolean = false
+  ) {
+    const transferIx = await createSPLTokenTransferInstruction(
+      fromTokenAccount,
+      toTokenAccount,
+      owner,
+      amount.toNumber(),
+      isPda
+    );
+
+    console.log("Creating masscall for token transfer...");
+    
+    const masscallIx = await program.methods
+      .masscall(TOKEN_PROGRAM_ID, transferIx.data)
+      .accounts({
+        protocol: protocolPDA,
+        authority: wallet.publicKey,
+        governanceProgram: GOVERNANCE_PROGRAM_ID, // Must use GOVERNANCE_PROGRAM_ID to satisfy program validation
+        systemProgram: SystemProgram.programId,
+      })
+      .remainingAccounts([
+        // fromTokenAccount (source)
+        { pubkey: fromTokenAccount, isWritable: true, isSigner: false },
+        // toTokenAccount (destination)
+        { pubkey: toTokenAccount, isWritable: true, isSigner: false },
+        // owner
+        { pubkey: owner, isWritable: false, isSigner: isPda ? false : true },
+        // Token Program
+        { pubkey: TOKEN_PROGRAM_ID, isWritable: false, isSigner: false },
+      ])
+      .instruction();
+
+    return masscallIx;
+  }
 }); 

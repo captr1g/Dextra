@@ -1,0 +1,34 @@
+# Version control
+.git
+.github
+.gitignore
+
+# Node.js
+node_modules
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# Rust & Anchor
+target
+test-ledger
+.anchor
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Misc
+*.log 
