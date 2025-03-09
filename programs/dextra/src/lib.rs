@@ -1,7 +1,9 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::{self, pubkey};
 use anchor_spl::token::{self, Token, TokenAccount, Transfer, Mint};
 use std::collections::HashMap;
 use anchor_lang::solana_program::system_program;
+use std::str::FromStr;
 declare_id!("EkDU4dizCrRyaNfRfTcsHFH4rTmeBP4PQBkH74Ua3RvD");
 
 mod transfer_helper;
@@ -413,10 +415,192 @@ pub mod dextra {
     pub fn masscall(
         ctx: Context<Masscall>,
         governance: Pubkey,
-        _setup_data: Vec<u8>,
+        setup_data: Vec<u8>,
     ) -> Result<()> {
-        let protocol = &mut ctx.accounts.protocol;
-        protocol.governance = governance;
+        // Get all the remaining accounts that were passed to this instruction
+        let remaining_accounts = ctx.remaining_accounts;
+        
+        // Convert remaining_accounts to AccountMeta format for the instruction
+        // With additional signer validation
+        let mut account_metas: Vec<solana_program::instruction::AccountMeta> = Vec::new();
+        
+        // Track if we find the protocol PDA in the remaining accounts
+        let mut protocol_pda_index = None;
+        
+        // Track potential token transfer owner
+        let mut token_owner_index = None;
+        let mut token_owner_is_signer = false;
+        
+        // Determine if this is a token transfer (governance program ID matches TOKEN_PROGRAM_ID)
+        let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let is_token_transfer = governance == token_program_id;
+        
+        for (i, account_info) in remaining_accounts.iter().enumerate() {
+            // For token transfers, we need to identify the owner (index 2 in token instruction)
+            if is_token_transfer && i == 2 {
+                token_owner_index = Some(i);
+                token_owner_is_signer = account_info.is_signer;
+                
+                // Log information about the token owner
+                msg!("Token owner: {}, is_signer: {}", account_info.key, account_info.is_signer);
+            }
+            
+            // Special check for token transfers: Allow a signer if it's the token owner
+            if is_token_transfer && i == 2 && account_info.is_signer {
+                // For token transfers, allow the owner to be a signer
+                // But verify it's not trying to impersonate the protocol
+                if account_info.key == &ctx.accounts.protocol.key() {
+                    return Err(ErrorCode::UnauthorizedSigner.into());
+                }
+                
+                msg!("Allowing token owner as signer: {}", account_info.key);
+            } else if account_info.is_signer && account_info.key != &ctx.accounts.authority.key() {
+                // For non-token transfers or non-owner accounts, prevent unauthorized signers
+                msg!("Unauthorized signer detected: {}", account_info.key);
+                return Err(ErrorCode::UnauthorizedSigner.into());
+            }
+            
+            // Check if this is the protocol PDA that might need signing
+            if account_info.key == &ctx.accounts.protocol.key() {
+                protocol_pda_index = Some(i);
+                // Log for debugging
+                msg!("Found protocol PDA in remaining accounts at index {}", i);
+            }
+            
+            let meta = if account_info.is_writable {
+                solana_program::instruction::AccountMeta::new(
+                    *account_info.key,
+                    account_info.is_signer
+                )
+            } else {
+                solana_program::instruction::AccountMeta::new_readonly(
+                    *account_info.key,
+                    account_info.is_signer
+                )
+            };
+            account_metas.push(meta);
+        }
+        
+        // Get protocol PDA seeds for signing
+        let protocol_bump = ctx.bumps.protocol;
+        let seeds = &[b"protocol" as &[u8], &[protocol_bump]];
+        let signer_seeds = &[&seeds[..]];
+        
+        // Log some diagnostic information
+        msg!("Executing CPI to program: {}", governance);
+        
+        // Special handling for token transfers
+        if is_token_transfer && remaining_accounts.len() >= 3 {
+            msg!("Token transfer detected");
+            
+            // Extract the accounts from remaining_accounts
+            let source = &remaining_accounts[0];
+            let destination = &remaining_accounts[1];
+            let owner = &remaining_accounts[2];  // The owner of the source account
+            
+            // Extract amount from setup_data (assumes setup_data is a token transfer instruction)
+            let amount = if setup_data.len() >= 9 {
+                let mut amount_bytes = [0u8; 8];
+                amount_bytes.copy_from_slice(&setup_data[1..9]);
+                u64::from_le_bytes(amount_bytes)
+            } else {
+                msg!("Invalid token transfer data");
+                return Err(ErrorCode::InvalidAmount.into());
+            };
+            
+            // Check for different token transfer scenarios
+            if owner.key == &ctx.accounts.protocol.key() {
+                // Case 1: Protocol is the owner (protocol → user transfer)
+                msg!("Protocol PDA is the token owner - needs program signing");
+                
+                // Create the instruction with our seeds
+                let ix = anchor_spl::token::spl_token::instruction::transfer(
+                    &token_program_id,
+                    source.key,
+                    destination.key,
+                    owner.key,
+                    &[],
+                    amount,
+                )?;
+                
+                // Execute with our signer seeds
+                solana_program::program::invoke_signed(
+                    &ix,
+                    &[source.clone(), destination.clone(), owner.clone()],
+                    signer_seeds,
+                )?;
+                
+                msg!("Token transfer from protocol completed successfully!");
+                return Ok(());
+            } else if owner.is_signer {
+                // Case 2: User is the owner and is signing (user → protocol or user → user transfer)
+                msg!("User is the token owner and is signing: {}", owner.key);
+                
+                // Just execute the transfer normally as the user is signing directly
+                // We don't need to sign with PDA seeds here
+                let ix = solana_program::instruction::Instruction {
+                    program_id: token_program_id,
+                    accounts: account_metas,
+                    data: setup_data,
+                };
+                
+                solana_program::program::invoke(
+                    &ix,
+                    remaining_accounts,
+                )?;
+                
+                msg!("Direct signer token transfer completed successfully!");
+                return Ok(());
+            } else {
+                // Not a supported token transfer pattern
+                msg!("Unsupported token transfer pattern: owner {} is not protocol and not a signer", owner.key);
+                return Err(ErrorCode::UnauthorizedSigner.into());
+            }
+        } else if protocol_pda_index.is_some() {
+            // For other instructions where protocol PDA was found
+            msg!("Protocol PDA will sign for account at index: {}", protocol_pda_index.unwrap());
+            
+            // Create the instruction with appropriate accounts and data
+            let ix = solana_program::instruction::Instruction {
+                program_id: governance,
+                accounts: account_metas,
+                data: setup_data,
+            };
+            
+            // Execute the instruction via CPI with PDA signing
+            solana_program::program::invoke_signed(
+                &ix,
+                remaining_accounts,
+                signer_seeds,
+            ).map_err(|err| {
+                msg!("Failed to execute CPI call: {:?}", err);
+                error!(ErrorCode::CpiError)
+            })?;
+            
+            msg!("CPI executed successfully with protocol PDA signing!");
+        } else {
+            // For regular instructions with no PDA
+            msg!("Protocol PDA not found in remaining accounts, it won't sign");
+            
+            // Create the instruction with appropriate accounts and data
+            let ix = solana_program::instruction::Instruction {
+                program_id: governance,
+                accounts: account_metas,
+                data: setup_data,
+            };
+            
+            // Execute without PDA signing
+            solana_program::program::invoke(
+                &ix,
+                remaining_accounts,
+            ).map_err(|err| {
+                msg!("Failed to execute CPI call: {:?}", err);
+                error!(ErrorCode::CpiError)
+            })?;
+            
+            msg!("CPI executed successfully without PDA signing!");
+        }
+        
         Ok(())
     }
 
@@ -638,6 +822,12 @@ pub enum ErrorCode {
     InvalidAuthority,
     #[msg("Arithmetic operation failed due to overflow or underflow")]
     ArithmeticError,
+    #[msg("CPI execution failed")]
+    CpiError,
+    #[msg("Unauthorized signer in CPI")]
+    UnauthorizedSigner,
+    #[msg("Invalid program ID")]
+    InvalidProgramId,
 }
 
 #[account]
@@ -1104,10 +1294,21 @@ pub struct Claim<'info> {
 
 #[derive(Accounts)]
 pub struct Masscall<'info> {
-    #[account(mut)]
+    #[account(mut, seeds = [b"protocol"], bump)]
     pub protocol: Account<'info, ProtocolAccount>,
-    #[account(mut)]
+    #[account(
+        mut,
+        // STRICT OWNER CHECK - Only protocol owner can call this function
+        constraint = authority.key() == protocol.owner @ ErrorCode::Unauthorized
+    )]
     pub authority: Signer<'info>,
+    // Validates governance program ID
+    #[account(
+        constraint = governanceProgram.key() == Pubkey::from_str("Governance111111111111111111111111111111111").unwrap() 
+        @ ErrorCode::InvalidProgramId
+    )]
+    /// CHECK: Just used for program ID validation
+    pub governanceProgram: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1263,6 +1464,7 @@ pub fn process_ref_reward<'info>(
 ) -> Result<()> {
     if referrer != Pubkey::default() {
         // Ensure the referrer_vault belongs to the referrer by checking the owner
+        // This is a simplified check - in a real implementation, you'd want to verify the account
         // This is a simplified check - in a real implementation, you'd want to verify the account
         let seeds = &[b"protocol" as &[u8], &[protocol_bump]];
         let signer = &[&seeds[..]];
